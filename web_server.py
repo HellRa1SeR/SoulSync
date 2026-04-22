@@ -18696,6 +18696,903 @@ def _build_post_processing_deps():
         on_download_completed=_on_download_completed,
     )
 
+        # Guard against double-calling: track which tasks have already been completed
+        # This prevents active_count from being decremented multiple times for the same task
+        # (e.g. monitor detects completion AND post-processing calls this again)
+        # NOTE: On duplicate calls, we skip decrement/tracking but STILL check batch completion.
+        # This is critical because the first call may see the task in 'post_processing' (not finished),
+        # and the second call (from post-processing worker) arrives after the task is truly 'completed'.
+        # Without the fallthrough, batch_complete would never be emitted.
+        completed_tasks = download_batches[batch_id].setdefault('_completed_task_ids', set())
+        _is_duplicate_completion = task_id in completed_tasks
+        if _is_duplicate_completion:
+            logger.info(f"[Batch Manager] Task {task_id} already completed — skipping decrement, still checking batch completion")
+            # Set terminal status so the monitor loop stops re-processing this task
+            if task_id in download_tasks and download_tasks[task_id].get('status') in ('downloading', 'queued'):
+                download_tasks[task_id]['status'] = 'completed'
+            # Fall through to batch completion check below (don't return)
+        else:
+            completed_tasks.add(task_id)
+
+        if not _is_duplicate_completion:
+            # Track failed/cancelled tasks in batch state (replicating sync.py)
+            if not success and task_id in download_tasks:
+                task = download_tasks[task_id]
+                task_status = task.get('status', 'unknown')
+
+                # Build track_info structure matching sync.py's permanently_failed_tracks format
+                original_track_info = task.get('track_info', {})
+
+                # Ensure spotify_track has proper structure for wishlist service
+                spotify_track_data = _ensure_spotify_track_format(original_track_info)
+
+                track_info = {
+                    'download_index': task.get('track_index', 0),
+                    'table_index': task.get('track_index', 0),
+                    'track_name': original_track_info.get('name', 'Unknown Track'),
+                    'artist_name': _get_track_artist_name(original_track_info),
+                    'retry_count': task.get('retry_count', 0),
+                    'spotify_track': spotify_track_data,  # Properly formatted spotify track for wishlist
+                    'failure_reason': 'Download cancelled' if task_status == 'cancelled' else ('No matching track found' if task_status == 'not_found' else 'Download failed'),
+                    'candidates': task.get('cached_candidates', [])  # Include search results if available
+                }
+
+                if task_status == 'cancelled':
+                    download_batches[batch_id]['cancelled_tracks'].add(task.get('track_index', 0))
+                    logger.warning(f"[Batch Manager] Added cancelled track to batch tracking: {track_info['track_name']}")
+                    add_activity_item("", "Download Cancelled", f"'{track_info['track_name']}'", "Now")
+                elif task_status in ('failed', 'not_found'):
+                    download_batches[batch_id]['permanently_failed_tracks'].append(track_info)
+                    if task_status == 'not_found':
+                        logger.info(f"[Batch Manager] Added not-found track to batch tracking: {track_info['track_name']}")
+                        add_activity_item("", "Not Found", f"'{track_info['track_name']}'", "Now")
+                    else:
+                        logger.error(f"[Batch Manager] Added failed track to batch tracking: {track_info['track_name']}")
+                        add_activity_item("", "Download Failed", f"'{track_info['track_name']}'", "Now")
+
+                    try:
+                        if automation_engine:
+                            automation_engine.emit('download_failed', {
+                                'artist': track_info.get('artist_name', ''),
+                                'title': track_info.get('track_name', ''),
+                                'reason': track_info.get('failure_reason', 'Unknown'),
+                            })
+                    except Exception:
+                        pass
+
+            # WISHLIST REMOVAL: Handle successful downloads for wishlist removal
+            if success and task_id in download_tasks:
+                try:
+                    task = download_tasks[task_id]
+                    track_info = task.get('track_info', {})
+                    logger.info(f"[Batch Manager] Successful download - checking wishlist removal for task {task_id}")
+
+                    # Add activity for successful download
+                    track_name = track_info.get('name', 'Unknown Track')
+
+                    # Safely extract artist name (handle both list and string formats)
+                    artists = track_info.get('artists', [])
+                    if isinstance(artists, list) and len(artists) > 0:
+                        first_artist = artists[0]
+                        artist_name = first_artist.get('name', 'Unknown Artist') if isinstance(first_artist, dict) else str(first_artist)
+                    elif isinstance(artists, str):
+                        artist_name = artists
+                    else:
+                        artist_name = 'Unknown Artist'
+
+                    add_activity_item("", "Download Complete", f"'{track_name}' by {artist_name}", "Now")
+
+                    # Try to remove from wishlist using track info
+                    if track_info:
+                        # Create a context-like structure for the wishlist removal function
+                        context = {
+                            'track_info': track_info,
+                            'original_search_result': track_info  # fallback
+                        }
+                        _check_and_remove_from_wishlist(context)
+                except Exception as wishlist_error:
+                    logger.error(f"[Batch Manager] Error checking wishlist removal for successful download: {wishlist_error}")
+
+            # Decrement active count
+            old_active = download_batches[batch_id]['active_count']
+            download_batches[batch_id]['active_count'] -= 1
+            new_active = download_batches[batch_id]['active_count']
+
+            logger.error(f"[Batch Manager] Task {task_id} completed ({'success' if success else 'failed/cancelled'}). Active workers: {old_active} → {new_active}/{download_batches[batch_id]['max_concurrent']}")
+
+        # ENHANCED: Always check batch completion after any task completes (including duplicate calls)
+        # This ensures completion is detected even when mixing normal downloads with cancelled tasks
+        logger.info(f"[Batch Manager] Checking batch completion after task {task_id} completed")
+        
+        # FIXED: Check if batch is truly complete (all tasks finished, not just workers freed)
+        batch = download_batches[batch_id]
+        all_tasks_started = batch['queue_index'] >= len(batch['queue'])
+        no_active_workers = batch['active_count'] == 0
+        
+        # Count actually finished tasks (completed, failed, or cancelled)
+        # CRITICAL: Don't include 'post_processing' as finished - it's still in progress (unless stuck)!
+        # CRITICAL: Don't include 'searching' as finished - task is being retried (unless stuck)!
+        finished_count = 0
+        retrying_count = 0
+        queue = batch.get('queue', [])
+        current_time = time.time()
+        for task_id in queue:
+            if task_id in download_tasks:
+                task = download_tasks[task_id]
+                task_status = task['status']
+
+                # STUCK DETECTION: Force fail tasks that have been in transitional states too long
+                if task_status == 'searching':
+                    task_age = current_time - task.get('status_change_time', current_time)
+                    if task_age > 600:  # 10 minutes
+                        logger.info(f"⏰ [Stuck Detection] Task {task_id} stuck in searching for {task_age:.0f}s - forcing not_found")
+                        task['status'] = 'not_found'
+                        task['error_message'] = f'Search stuck for {int(task_age // 60)} minutes with no results — timed out'
+                        finished_count += 1
+                    else:
+                        retrying_count += 1
+                elif task_status == 'post_processing':
+                    task_age = current_time - task.get('status_change_time', current_time)
+                    if task_age > 300:  # 5 minutes (post-processing should be fast)
+                        logger.info(f"⏰ [Stuck Detection] Task {task_id} stuck in post_processing for {task_age:.0f}s - forcing completion")
+                        task['status'] = 'completed'  # Assume it worked if file verification is taking too long
+                        finished_count += 1
+                    else:
+                        retrying_count += 1
+                elif task_status in ['completed', 'failed', 'cancelled', 'not_found']:
+                    finished_count += 1
+            else:
+                # Task ID in queue but not in download_tasks - treat as completed to prevent blocking
+                logger.warning(f"[Orphaned Task] Task {task_id} in queue but not in download_tasks - counting as finished")
+                finished_count += 1
+        
+        all_tasks_truly_finished = finished_count >= len(queue)
+        has_retrying_tasks = retrying_count > 0
+        
+        if all_tasks_started and no_active_workers and all_tasks_truly_finished and not has_retrying_tasks:
+            logger.error(f"[Batch Manager] Batch {batch_id} truly complete - all {finished_count}/{len(queue)} tasks finished - processing failed tracks to wishlist")
+        elif all_tasks_started and no_active_workers and has_retrying_tasks:
+            logger.warning(f"[Batch Manager] Batch {batch_id}: all workers free but {retrying_count} tasks retrying - continuing monitoring")
+        elif all_tasks_started and no_active_workers:
+            # This used to incorrectly mark batch as complete!
+            logger.info(f"[Batch Manager] Batch {batch_id}: all workers free but only {finished_count}/{len(queue)} tasks finished - continuing monitoring")
+        
+        if all_tasks_started and no_active_workers and all_tasks_truly_finished and not has_retrying_tasks:
+            
+            # Check if this is an auto-initiated batch
+            is_auto_batch = batch.get('auto_initiated', False)
+            
+            # FIXED: Ensure batch is not already marked as complete to prevent duplicate processing
+            if batch.get('phase') != 'complete':
+                # Mark batch as complete and set completion timestamp for auto-cleanup
+                batch['phase'] = 'complete'
+                batch['completion_time'] = time.time()  # Track when batch completed
+
+                # Record sync history completion
+                _record_sync_history_completion(batch_id, batch)
+
+                # Add activity for batch completion
+                playlist_name = batch.get('playlist_name', 'Unknown Playlist')
+                failed_count = len(batch.get('permanently_failed_tracks', []))
+                successful_downloads = finished_count - failed_count
+                add_activity_item("", "Download Batch Complete", f"'{playlist_name}' - {successful_downloads} tracks downloaded", "Now")
+
+                # Emit batch_complete event for automation engine (only if something downloaded)
+                if successful_downloads > 0:
+                    try:
+                        if automation_engine:
+                            automation_engine.emit('batch_complete', {
+                                'playlist_name': playlist_name,
+                                'total_tracks': str(len(queue)),
+                                'completed_tracks': str(successful_downloads),
+                                'failed_tracks': str(failed_count),
+                            })
+                    except Exception:
+                        pass
+
+                # Push discover playlists to media server after downloads complete
+                playlist_id = batch.get('playlist_id')
+                if playlist_id and playlist_id.startswith('discover_'):
+                    threading.Thread(
+                        target=_push_discover_playlist_to_server,
+                        args=(batch_id, batch),
+                        daemon=True
+                    ).start()
+
+                # Update YouTube playlist phase to 'download_complete' if this is a YouTube playlist
+                if playlist_id and playlist_id.startswith('youtube_'):
+                    url_hash = playlist_id.replace('youtube_', '')
+                    if url_hash in youtube_playlist_states:
+                        youtube_playlist_states[url_hash]['phase'] = 'download_complete'
+                        logger.info(f"Updated YouTube playlist {url_hash} to download_complete phase")
+
+                # Update Tidal playlist phase to 'download_complete' if this is a Tidal playlist
+                if playlist_id and playlist_id.startswith('tidal_'):
+                    tidal_playlist_id = playlist_id.replace('tidal_', '')
+                    if tidal_playlist_id in tidal_discovery_states:
+                        tidal_discovery_states[tidal_playlist_id]['phase'] = 'download_complete'
+                        logger.info(f"Updated Tidal playlist {tidal_playlist_id} to download_complete phase")
+
+                # Update Deezer playlist phase to 'download_complete' if this is a Deezer playlist
+                if playlist_id and playlist_id.startswith('deezer_'):
+                    deezer_playlist_id = playlist_id.replace('deezer_', '')
+                    if deezer_playlist_id in deezer_discovery_states:
+                        deezer_discovery_states[deezer_playlist_id]['phase'] = 'download_complete'
+                        logger.info(f"Updated Deezer playlist {deezer_playlist_id} to download_complete phase")
+
+                # Update Spotify Public playlist phase to 'download_complete' if this is a Spotify Public playlist
+                if playlist_id and playlist_id.startswith('spotify_public_'):
+                    spotify_public_url_hash = playlist_id.replace('spotify_public_', '')
+                    if spotify_public_url_hash in spotify_public_discovery_states:
+                        spotify_public_discovery_states[spotify_public_url_hash]['phase'] = 'download_complete'
+                        logger.info(f"Updated Spotify Public playlist {spotify_public_url_hash} to download_complete phase")
+
+                logger.info(f"[Batch Manager] Batch {batch_id} complete - stopping monitor")
+                download_monitor.stop_monitoring(batch_id)
+
+                # M3U REGENERATION: Regenerate M3U with real library paths now that
+                # all post-processing (tagging, moving, DB writes) is complete.
+                # The frontend M3U save may fire too early — this ensures paths resolve.
+                if config_manager.get('m3u_export.enabled', False):
+                    try:
+                        m3u_tracks = []
+                        for tid in queue:
+                            if tid in download_tasks and download_tasks[tid].get('status') == 'completed':
+                                ti = download_tasks[tid].get('track_info', {})
+                                artists = ti.get('artists', [])
+                                artist_str = artists[0] if isinstance(artists, list) and artists else ''
+                                if isinstance(artist_str, dict):
+                                    artist_str = artist_str.get('name', '')
+                                m3u_tracks.append({
+                                    'name': ti.get('name', ''),
+                                    'artist': artist_str,
+                                    'duration_ms': ti.get('duration_ms', 0),
+                                })
+                        if m3u_tracks:
+                            _regenerate_batch_m3u(batch, m3u_tracks)
+                    except Exception as m3u_err:
+                        logger.error(f"[M3U] Error regenerating M3U on batch complete: {m3u_err}")
+
+                # REPAIR: Scan all album folders from this batch for track number issues
+                if repair_worker:
+                    repair_worker.process_batch(batch_id)
+
+                # ALBUM CONSISTENCY: Picard-style post-batch pass — pick ONE MusicBrainz
+                # release and overwrite album-level tags on all files to guarantee consistency.
+                # This is the safety net: even if per-track MB lookups drifted (different cache
+                # keys, API hiccups), this pass forces every file to share the same release MBID,
+                # album artist ID, release group ID, etc. — preventing Navidrome album splits.
+                _cons_files = batch.get('_consistency_files', [])
+                if batch.get('is_album_download') and _cons_files and len(_cons_files) >= 2:
+                    _cons_album = batch.get('album_context', {})
+                    _cons_artist = batch.get('artist_context', {})
+                    _cons_album_name = _cons_album.get('name', '') if isinstance(_cons_album, dict) else ''
+                    _cons_artist_name = _cons_artist.get('name', '') if isinstance(_cons_artist, dict) else ''
+                    if _cons_album_name and _cons_artist_name:
+                        try:
+                            _cons_mb_svc = mb_worker.mb_service if mb_worker else None
+                            if _cons_mb_svc and config_manager.get('musicbrainz.embed_tags', True):
+                                from core.album_consistency import run_album_consistency
+                                _cons_result = run_album_consistency(
+                                    file_infos=_cons_files,
+                                    album_name=_cons_album_name,
+                                    artist_name=_cons_artist_name,
+                                    mb_service=_cons_mb_svc,
+                                    total_discs=_cons_album.get('total_discs', 1),
+                                    file_lock_fn=_get_file_lock,
+                                )
+                                if _cons_result.get('success'):
+                                    logger.info(f"[Album Consistency] {_cons_result['tags_written']}/{_cons_result['total_files']} files "
+                                          f"harmonized to release {_cons_result.get('release_mbid', '')[:8]}...")
+                                elif _cons_result.get('error'):
+                                    logger.error(f"[Album Consistency] Skipped: {_cons_result['error']}")
+                        except Exception as cons_err:
+                            logger.error(f"[Album Consistency] Failed (non-fatal): {cons_err}")
+
+                # Mark that wishlist processing is starting (prevents premature cleanup)
+                batch['wishlist_processing_started'] = True
+
+                # Process wishlist outside of the lock to prevent threading issues
+                if is_auto_batch:
+                    # For auto-initiated batches, handle completion and schedule next cycle
+                    missing_download_executor.submit(_process_failed_tracks_to_wishlist_exact_with_auto_completion, batch_id)
+                else:
+                    # For manual batches, use standard wishlist processing
+                    missing_download_executor.submit(_process_failed_tracks_to_wishlist_exact, batch_id)
+            else:
+                logger.warning(f"[Batch Manager] Batch {batch_id} already marked complete - skipping duplicate processing")
+
+            return  # Don't start next batch if we're done
+    
+    # Start next downloads in queue
+    logger.info(f"[Batch Manager] Starting next batch for {batch_id}")
+    _start_next_batch_of_downloads(batch_id)
+
+def _run_full_missing_tracks_process(batch_id, playlist_id, tracks_json):
+    """
+    A master worker that handles the entire missing tracks process:
+    1. Runs the analysis.
+    2. If missing tracks are found, it automatically queues them for download.
+    """
+    try:
+        # PHASE 1: ANALYSIS
+        with tasks_lock:
+            if batch_id in download_batches:
+                download_batches[batch_id]['phase'] = 'analysis'
+                download_batches[batch_id]['analysis_total'] = len(tracks_json)
+                download_batches[batch_id]['analysis_processed'] = 0
+
+        from database.music_database import MusicDatabase
+        db = MusicDatabase()
+        active_server = config_manager.get_active_media_server()
+        analysis_results = []
+
+        # Get force download flag and album context from batch
+        force_download_all = False
+        batch_album_context = None
+        batch_artist_context = None
+        batch_is_album = False
+        with tasks_lock:
+            if batch_id in download_batches:
+                force_download_all = download_batches[batch_id].get('force_download_all', False)
+                batch_is_album = download_batches[batch_id].get('is_album_download', False)
+                batch_album_context = download_batches[batch_id].get('album_context')
+                batch_artist_context = download_batches[batch_id].get('artist_context')
+
+        if force_download_all:
+            logger.warning(f"[Force Download] Force download mode enabled for batch {batch_id} - treating all tracks as missing")
+
+        # Allow duplicate tracks across albums — when enabled, only skip tracks already
+        # owned in THIS album, not tracks owned in other albums
+        allow_duplicates = config_manager.get('wishlist.allow_duplicate_tracks', True)
+        if allow_duplicates and batch_is_album:
+            logger.info("[Duplicates] Allow duplicate tracks enabled — only checking ownership within target album")
+
+        # PREFLIGHT: Pre-populate MusicBrainz release cache for album downloads.
+        # This ensures ALL tracks in the album use the same release MBID during
+        # per-track post-processing, preventing Navidrome album splits.
+        if batch_is_album and batch_album_context and batch_artist_context:
+            try:
+                album_name_pf = batch_album_context.get('name', '')
+                artist_name_pf = batch_artist_context.get('name', '')
+                if album_name_pf and artist_name_pf:
+                    mb_svc = mb_worker.mb_service if mb_worker else None
+                    if mb_svc:
+                        from core.album_consistency import _find_best_release
+                        release = _find_best_release(album_name_pf, artist_name_pf, len(tracks_json), mb_svc)
+                        if release and release.get('id'):
+                            release_mbid = release['id']
+                            _artist_key = artist_name_pf.lower().strip()
+                            _rc_key_norm = (_normalize_album_cache_key(album_name_pf), _artist_key)
+                            _rc_key_exact = (album_name_pf.lower().strip(), _artist_key)
+                            with _mb_release_cache_lock:
+                                _mb_release_cache[_rc_key_norm] = release_mbid
+                                _mb_release_cache[_rc_key_exact] = release_mbid
+                            # Also cache the full release detail for tag extraction
+                            with _mb_release_detail_cache_lock:
+                                _mb_release_detail_cache[release_mbid] = release
+                            logger.info(f"[Preflight] Pre-cached MB release for '{album_name_pf}': "
+                                  f"'{release.get('title', '')}' ({release_mbid[:8]}...)")
+                        else:
+                            logger.warning(f"[Preflight] No MB release found for '{album_name_pf}' — per-track lookup will be used")
+            except Exception as pf_err:
+                logger.error(f"[Preflight] MB release preflight failed: {pf_err}")
+
+        # ALBUM FAST PATH: If this is an album download, try to find the album in the DB first
+        # and match tracks within it — faster and more accurate than N global searches
+        album_tracks_map = {}  # Maps normalized title -> DatabaseTrack for album-scoped matching
+        if batch_is_album and batch_album_context and batch_artist_context and not force_download_all:
+            album_name = batch_album_context.get('name', '')
+            artist_name = batch_artist_context.get('name', '')
+            total_tracks = batch_album_context.get('total_tracks', 0)
+            if album_name and artist_name:
+                try:
+                    db_album, album_confidence = db.check_album_exists_with_editions(
+                        title=album_name, artist=artist_name,
+                        confidence_threshold=0.7,
+                        expected_track_count=total_tracks if total_tracks > 0 else None,
+                        server_source=active_server
+                    )
+                    if db_album and album_confidence >= 0.7:
+                        db_album_tracks = db.get_tracks_by_album(db_album.id)
+                        for t in db_album_tracks:
+                            album_tracks_map[t.title.lower().strip()] = t
+                        logger.info(f"[Album Analysis] Found album '{db_album.title}' in DB with {len(db_album_tracks)} tracks (confidence: {album_confidence:.2f})")
+                    else:
+                        logger.warning(f"[Album Analysis] Album '{album_name}' not found in DB — falling back to per-track search")
+                except Exception as album_err:
+                    logger.error(f"[Album Analysis] Album lookup error: {album_err} — falling back to per-track search")
+
+        for i, track_data in enumerate(tracks_json):
+            # Use original table index if provided (for partial track selection),
+            # otherwise fall back to enumeration index
+            track_index = track_data.get('_original_index', i)
+            track_name = track_data.get('name', '')
+            artists = track_data.get('artists', [])
+            found, confidence = False, 0.0
+
+            # Skip database check if force download is enabled
+            if force_download_all:
+                logger.warning(f"[Force Download] Skipping database check for '{track_name}' - treating as missing")
+                found, confidence = False, 0.0
+            elif album_tracks_map:
+                # Album-scoped matching: check against known album tracks first
+                track_name_lower = track_name.lower().strip()
+                # Direct title match
+                if track_name_lower in album_tracks_map:
+                    found, confidence = True, 1.0
+                else:
+                    # Fuzzy match against album tracks using string similarity
+                    best_sim = 0.0
+                    for db_title_lower, _db_track in album_tracks_map.items():
+                        sim = db._string_similarity(track_name_lower, db_title_lower)
+                        if sim > best_sim:
+                            best_sim = sim
+                    if best_sim >= 0.7:
+                        found, confidence = True, best_sim
+                    else:
+                        # Fall back to global per-track search for this track
+                        # When allow_duplicates is on for album downloads, skip global
+                        # search — the track isn't in THIS album so treat as missing
+                        if allow_duplicates and batch_is_album:
+                            found, confidence = False, 0.0
+                        else:
+                            _fallback_album = batch_album_context.get('name') if batch_album_context else None
+                            for artist in artists:
+                                if isinstance(artist, str):
+                                    artist_name = artist
+                                elif isinstance(artist, dict) and 'name' in artist:
+                                    artist_name = artist['name']
+                                else:
+                                    artist_name = str(artist)
+                                db_track, track_confidence = db.check_track_exists(
+                                    track_name, artist_name, confidence_threshold=0.7, server_source=active_server, album=_fallback_album
+                                )
+                                if db_track and track_confidence >= 0.7:
+                                    found, confidence = True, track_confidence
+                                    break
+            elif allow_duplicates and batch_is_album:
+                # Allow duplicates + album download + album not in DB yet → treat all as missing
+                found, confidence = False, 0.0
+            else:
+                # Non-album download (playlist/single track) — always check global
+                for artist in artists:
+                    # Handle both string format and Spotify API format {'name': 'Artist Name'}
+                    if isinstance(artist, str):
+                        artist_name = artist
+                    elif isinstance(artist, dict) and 'name' in artist:
+                        artist_name = artist['name']
+                    else:
+                        artist_name = str(artist)
+                    db_track, track_confidence = db.check_track_exists(
+                        track_name, artist_name, confidence_threshold=0.7, server_source=active_server
+                    )
+                    if db_track and track_confidence >= 0.7:
+                        found, confidence = True, track_confidence
+                        break
+
+            analysis_results.append({
+                'track_index': track_index, 'track': track_data, 'found': found, 'confidence': confidence
+            })
+            
+            # WISHLIST REMOVAL: If track is found in database, check if it should be removed from wishlist
+            if found and confidence >= 0.7:
+                try:
+                    _check_and_remove_track_from_wishlist_by_metadata(track_data)
+                except Exception as wishlist_error:
+                    logger.error(f"[Analysis] Error checking wishlist removal for found track: {wishlist_error}")
+
+            with tasks_lock:
+                if batch_id in download_batches:
+                    download_batches[batch_id]['analysis_processed'] = i + 1
+                    # Store incremental results for live updates
+                    download_batches[batch_id]['analysis_results'] = analysis_results.copy()
+
+        missing_tracks = [res for res in analysis_results if not res['found']]
+
+        # Filter explicit tracks if content filter is enabled
+        if not config_manager.get('content_filter.allow_explicit', True):
+            before_count = len(missing_tracks)
+            missing_tracks = [res for res in missing_tracks if not _is_explicit_blocked(res.get('track', {}))]
+            skipped = before_count - len(missing_tracks)
+            if skipped > 0:
+                logger.warning(f"[Content Filter] Filtered out {skipped} explicit track(s) from download queue")
+
+        with tasks_lock:
+            if batch_id in download_batches:
+                download_batches[batch_id]['analysis_results'] = analysis_results
+
+        # PHASE 2: TRANSITION TO DOWNLOAD (if necessary)
+        if not missing_tracks:
+            logger.warning(f"Analysis for batch {batch_id} complete. No missing tracks.")
+
+            # Record sync history — all tracks found, nothing to download
+            tracks_found = sum(1 for r in analysis_results if r.get('found'))
+            try:
+                db_sh = MusicDatabase()
+                db_sh.update_sync_history_completion(batch_id, tracks_found=tracks_found, tracks_downloaded=0, tracks_failed=0)
+                # Save per-track results (all found, no downloads)
+                track_results = []
+                for res in analysis_results:
+                    td = res.get('track', {})
+                    artists = td.get('artists', [])
+                    first_artist = (artists[0].get('name', artists[0]) if isinstance(artists[0], dict) else str(artists[0])) if artists else ''
+                    alb = td.get('album', '')
+                    # Extract image
+                    _img = ''
+                    _alb_obj = td.get('album', {})
+                    if isinstance(_alb_obj, dict):
+                        _alb_imgs = _alb_obj.get('images', [])
+                        if _alb_imgs and isinstance(_alb_imgs, list) and len(_alb_imgs) > 0:
+                            _img = _alb_imgs[0].get('url', '') if isinstance(_alb_imgs[0], dict) else ''
+                    track_results.append({
+                        'index': res.get('track_index', 0),
+                        'name': td.get('name', ''),
+                        'artist': first_artist,
+                        'album': alb.get('name', '') if isinstance(alb, dict) else str(alb or ''),
+                        'image_url': _img,
+                        'duration_ms': td.get('duration_ms', 0),
+                        'source_track_id': td.get('id', ''),
+                        'status': 'found' if res.get('found') else 'not_found',
+                        'confidence': round(res.get('confidence', 0.0), 3),
+                        'matched_track': None,
+                        'download_status': None,
+                    })
+                if track_results:
+                    db_sh.update_sync_history_track_results(batch_id, json.dumps(track_results))
+            except Exception:
+                pass
+
+            is_auto_batch = False
+            with tasks_lock:
+                if batch_id in download_batches:
+                    is_auto_batch = download_batches[batch_id].get('auto_initiated', False)
+                    download_batches[batch_id]['phase'] = 'complete'
+                    download_batches[batch_id]['completion_time'] = time.time()  # Track for auto-cleanup
+
+                    # Update YouTube playlist phase to 'download_complete' if this is a YouTube playlist
+                    if playlist_id.startswith('youtube_'):
+                        url_hash = playlist_id.replace('youtube_', '')
+                        if url_hash in youtube_playlist_states:
+                            youtube_playlist_states[url_hash]['phase'] = 'download_complete'
+                            logger.warning(f"Updated YouTube playlist {url_hash} to download_complete phase (no missing tracks)")
+
+                    # Update Tidal playlist phase to 'download_complete' if this is a Tidal playlist
+                    if playlist_id.startswith('tidal_'):
+                        tidal_playlist_id = playlist_id.replace('tidal_', '')
+                        if tidal_playlist_id in tidal_discovery_states:
+                            tidal_discovery_states[tidal_playlist_id]['phase'] = 'download_complete'
+                            logger.warning(f"Updated Tidal playlist {tidal_playlist_id} to download_complete phase (no missing tracks)")
+
+                    # Update Deezer playlist phase to 'download_complete' if this is a Deezer playlist
+                    if playlist_id.startswith('deezer_'):
+                        deezer_playlist_id = playlist_id.replace('deezer_', '')
+                        if deezer_playlist_id in deezer_discovery_states:
+                            deezer_discovery_states[deezer_playlist_id]['phase'] = 'download_complete'
+                            logger.warning(f"Updated Deezer playlist {deezer_playlist_id} to download_complete phase (no missing tracks)")
+
+                    # Update Spotify Public playlist phase to 'download_complete' if this is a Spotify Public playlist
+                    if playlist_id.startswith('spotify_public_'):
+                        spotify_public_url_hash = playlist_id.replace('spotify_public_', '')
+                        if spotify_public_url_hash in spotify_public_discovery_states:
+                            spotify_public_discovery_states[spotify_public_url_hash]['phase'] = 'download_complete'
+                            logger.warning(f"Updated Spotify Public playlist {spotify_public_url_hash} to download_complete phase (no missing tracks)")
+
+            # Handle auto-initiated wishlist completion even when no missing tracks
+            if is_auto_batch and playlist_id == 'wishlist':
+                logger.warning("[Auto-Wishlist] No missing tracks found - calling auto-completion handler to toggle cycle and reschedule")
+                missing_download_executor.submit(_process_failed_tracks_to_wishlist_exact_with_auto_completion, batch_id)
+
+            return
+
+        logger.warning(f" transitioning batch {batch_id} to download phase with {len(missing_tracks)} tracks.")
+
+        # Read batch context (quick lock) before doing any network I/O
+        with tasks_lock:
+            if batch_id not in download_batches: return
+            batch = download_batches[batch_id]
+            batch_album_context = batch.get('album_context')
+            batch_artist_context = batch.get('artist_context')
+            batch_is_album = batch.get('is_album_download', False)
+            batch_playlist_folder_mode = batch.get('playlist_folder_mode', False)
+            batch_playlist_name = batch.get('playlist_name', 'Unknown Playlist')
+
+        # === ALBUM PRE-FLIGHT: Search for complete album folder before track-by-track ===
+        # Only run pre-flight when Soulseek is the download source (or hybrid with soulseek)
+        preflight_source = None
+        preflight_tracks = None
+        dl_source_mode = config_manager.get('download_source.mode', 'hybrid')
+        _dl_hybrid_order = config_manager.get('download_source.hybrid_order', ['hifi', 'youtube', 'soulseek'])
+        _dl_hybrid_first = _dl_hybrid_order[0] if _dl_hybrid_order else config_manager.get('download_source.hybrid_primary', 'hifi')
+        soulseek_is_source = dl_source_mode == 'soulseek' or (
+            dl_source_mode == 'hybrid' and _dl_hybrid_first == 'soulseek'
+        )
+        if batch_is_album and batch_album_context and batch_artist_context and soulseek_is_source:
+            artist_name = batch_artist_context.get('name', '')
+            album_name = batch_album_context.get('name', '')
+            if artist_name and album_name:
+                try:
+                    _sr = source_reuse_logger
+                    _sr.info(f"[Album Pre-flight] Searching for '{artist_name} {album_name}'")
+                    logger.info(f"[Album Pre-flight] Searching Soulseek for complete album: '{artist_name} - {album_name}'")
+
+                    slsk = soulseek_client.soulseek if hasattr(soulseek_client, 'soulseek') else soulseek_client
+
+                    # Try multiple query variations (banned keywords in artist/album name can return 0 results)
+                    album_queries = [f"{artist_name} {album_name}"]
+                    # Clean artist name (remove feat., parentheticals)
+                    clean_artist = re.sub(r'\s*\(.*?\)', '', artist_name).strip()
+                    clean_artist = re.sub(r'\s*(feat\.?|ft\.?|featuring)\s+.*$', '', clean_artist, flags=re.IGNORECASE).strip()
+                    if clean_artist != artist_name:
+                        album_queries.append(f"{clean_artist} {album_name}")
+                    # Album name only (some users file by album)
+                    album_queries.append(album_name)
+
+                    album_results = []
+                    track_results = []
+                    for aq in album_queries:
+                        _sr.info(f"[Album Pre-flight] Trying query: '{aq}'")
+                        track_results, album_results = run_async(slsk.search(aq, timeout=30))
+                        if album_results:
+                            _sr.info(f"[Album Pre-flight] Found {len(album_results)} album results with query: '{aq}'")
+                            break
+                        _sr.info(f"[Album Pre-flight] No album results for query: '{aq}'")
+
+                    if album_results:
+                        # Filter by quality preference
+                        quality_filtered = []
+                        for ar in album_results:
+                            filtered_tracks = slsk.filter_results_by_quality_preference(ar.tracks)
+                            if filtered_tracks:
+                                quality_filtered.append((ar, len(filtered_tracks)))
+
+                        if quality_filtered:
+                            # Sort by track count (most complete album first), then quality score
+                            quality_filtered.sort(key=lambda x: (x[1], x[0].quality_score), reverse=True)
+                            best_album = quality_filtered[0][0]
+
+                            _sr.info(f"[Album Pre-flight] Best album result: {best_album.username}:{best_album.album_path} "
+                                     f"({best_album.track_count} tracks, quality={best_album.dominant_quality})")
+                            logger.info(f"[Album Pre-flight] Found album folder: {best_album.username} — "
+                                  f"{best_album.track_count} tracks ({best_album.dominant_quality})")
+
+                            # Browse the user's folder to get all tracks (may have more than search returned)
+                            browse_files = run_async(slsk.browse_user_directory(best_album.username, best_album.album_path))
+                            if browse_files:
+                                folder_tracks = slsk.parse_browse_results_to_tracks(
+                                    best_album.username, browse_files, directory=best_album.album_path
+                                )
+                                if folder_tracks:
+                                    preflight_source = {
+                                        'username': best_album.username,
+                                        'folder_path': best_album.album_path
+                                    }
+                                    preflight_tracks = folder_tracks
+                                    _sr.info(f"[Album Pre-flight] Browsed folder: {len(folder_tracks)} audio tracks available")
+                                    logger.info(f"[Album Pre-flight] Cached {len(folder_tracks)} tracks from {best_album.username} for source reuse")
+                                else:
+                                    _sr.info("[Album Pre-flight] Browse returned files but no audio tracks")
+                            else:
+                                # Browse failed — fall back to using the search result tracks directly
+                                _sr.info("[Album Pre-flight] Browse failed, using search result tracks directly")
+                                preflight_source = {
+                                    'username': best_album.username,
+                                    'folder_path': best_album.album_path
+                                }
+                                preflight_tracks = best_album.tracks
+                                logger.info(f"[Album Pre-flight] Using {len(best_album.tracks)} tracks from search results (browse unavailable)")
+                        else:
+                            _sr.info("[Album Pre-flight] No album results passed quality filter")
+                            logger.warning("[Album Pre-flight] No album results matched quality preferences")
+                    else:
+                        _sr.info(f"[Album Pre-flight] Search returned no album results (got {len(track_results)} individual tracks)")
+                        logger.warning("[Album Pre-flight] No complete album folders found, falling back to track-by-track search")
+
+                except Exception as preflight_err:
+                    logger.error(f"[Album Pre-flight] Search failed (non-fatal, falling back to track-by-track): {preflight_err}")
+                    source_reuse_logger.info(f"[Album Pre-flight] Exception: {preflight_err}")
+
+        with tasks_lock:
+            if batch_id not in download_batches: return
+
+            download_batches[batch_id]['phase'] = 'downloading'
+
+            # Store album pre-flight results on batch for source reuse
+            if preflight_source and preflight_tracks:
+                download_batches[batch_id]['last_good_source'] = preflight_source
+                download_batches[batch_id]['source_folder_tracks'] = preflight_tracks
+                download_batches[batch_id]['failed_sources'] = set()
+                logger.info(f"[Album Pre-flight] Pre-loaded source reuse data on batch {batch_id}")
+
+            # Compute total_discs for multi-disc album subfolder support
+            # Use ALL tracks (tracks_json), not just missing ones, to correctly detect multi-disc
+            # even when only one disc has missing tracks
+            if batch_is_album and batch_album_context:
+                total_discs = max((t.get('disc_number', 1) for t in tracks_json), default=1)
+                batch_album_context['total_discs'] = total_discs
+                if total_discs > 1:
+                    logger.info(f"[Multi-Disc] Detected {total_discs} discs for album '{batch_album_context.get('name')}'")
+
+            # Pre-compute per-album data for wishlist tracks (grouped by album ID)
+            # Wishlist tracks aren't batch_is_album but each track has disc_number in spotify_data
+            wishlist_album_disc_counts = {}
+            wishlist_album_artist_map = {}  # album_id -> resolved artist context (consistent per album)
+            if playlist_id == 'wishlist':
+                import json as _json
+                # First pass: collect disc_number and resolve ONE artist per album
+                for t in tracks_json:
+                    sp_data = t.get('spotify_data', {})
+                    if isinstance(sp_data, str):
+                        try:
+                            sp_data = _json.loads(sp_data)
+                        except:
+                            sp_data = {}
+                    album_val = sp_data.get('album')
+                    album_id = album_val.get('id') if isinstance(album_val, dict) else album_val if isinstance(album_val, str) else None
+                    # Fallback album key: use album name when ID is missing (e.g. mirrored playlist tracks)
+                    if not album_id and isinstance(album_val, dict) and album_val.get('name'):
+                        album_id = f"_name_{album_val['name'].lower().strip()}"
+                    disc_num = sp_data.get('disc_number', t.get('disc_number', 1))
+                    if album_id:
+                        wishlist_album_disc_counts[album_id] = max(
+                            wishlist_album_disc_counts.get(album_id, 1), disc_num
+                        )
+                        # Resolve album-level artist once per album (first track wins)
+                        if album_id not in wishlist_album_artist_map:
+                            _wl_source = t.get('source_info') or {}
+                            if isinstance(_wl_source, str):
+                                try:
+                                    _wl_source = _json.loads(_wl_source)
+                                except:
+                                    _wl_source = {}
+                            _wl_album = album_val if isinstance(album_val, dict) else {}
+                            _wl_album_artists = _wl_album.get('artists', [])
+                            # Priority: watchlist artist > album artists > track artists
+                            if _wl_source.get('watchlist_artist_name'):
+                                wishlist_album_artist_map[album_id] = {
+                                    'name': _wl_source['watchlist_artist_name'],
+                                    'id': _wl_source.get('watchlist_artist_id', '')
+                                }
+                            elif _wl_source.get('artist_name'):
+                                wishlist_album_artist_map[album_id] = {'name': _wl_source['artist_name']}
+                            elif _wl_album_artists:
+                                _fa = _wl_album_artists[0]
+                                wishlist_album_artist_map[album_id] = _fa if isinstance(_fa, dict) else {'name': str(_fa)}
+                            else:
+                                _wl_track_artists = sp_data.get('artists', [])
+                                if _wl_track_artists:
+                                    _fa = _wl_track_artists[0]
+                                    wishlist_album_artist_map[album_id] = _fa if isinstance(_fa, dict) else {'name': str(_fa)}
+                                else:
+                                    # Try top-level 'artists' (wishlist format uses plural)
+                                    _tl_artists = t.get('artists', [])
+                                    if _tl_artists:
+                                        _tla = _tl_artists[0]
+                                        _fallback_name = _tla.get('name', str(_tla)) if isinstance(_tla, dict) else str(_tla)
+                                    else:
+                                        _fallback_name = t.get('artist', '')
+                                    wishlist_album_artist_map[album_id] = {'name': _fallback_name or 'Unknown Artist'}
+                            logger.info(f"[Wishlist Album Grouping] Album '{_wl_album.get('name', album_id)}' → artist: '{wishlist_album_artist_map[album_id].get('name', '?')}'")
+
+
+
+            for res in missing_tracks:
+                task_id = str(uuid.uuid4())
+                track_info = res['track'].copy()
+
+                # Add explicit album context to track_info for artist album downloads
+                if batch_is_album and batch_album_context and batch_artist_context:
+                    track_info['_explicit_album_context'] = batch_album_context
+                    track_info['_explicit_artist_context'] = batch_artist_context
+                    track_info['_is_explicit_album_download'] = True
+                    logger.info(f"[Task Creation] Added explicit album context for: {track_info.get('name')}")
+
+                # SPECIAL WISHLIST HANDLING: Inject album context if available to force grouping
+                elif playlist_id == 'wishlist':
+                    # Extract spotify_data again since it might be buried
+                    spotify_data = track_info.get('spotify_data')
+                    if isinstance(spotify_data, str):
+                        try:
+                            spotify_data = json.loads(spotify_data)
+                        except:
+                            spotify_data = {}
+                    
+                    if not spotify_data:
+                        spotify_data = {}
+
+                    s_album = spotify_data.get('album') or {}
+                    if isinstance(s_album, str):
+                        s_album = {'name': s_album}  # Normalize string album to dict
+                    s_artists = spotify_data.get('artists', [])
+
+                    # We need at least an album name and artist
+                    if s_album and isinstance(s_album, dict) and s_album.get('name'):
+                        # Use pre-computed album-level artist for folder consistency.
+                        # All tracks from the same album get the same artist context,
+                        # preventing folder splits on collab albums (KPOP Demon Hunters, etc.)
+                        album_id_for_lookup = s_album.get('id')
+                        # Fallback album key: match first-pass logic for missing IDs
+                        if not album_id_for_lookup and s_album.get('name'):
+                            album_id_for_lookup = f"_name_{s_album['name'].lower().strip()}"
+                        if not album_id_for_lookup:
+                            album_id_for_lookup = 'wishlist_album'
+                        artist_ctx = wishlist_album_artist_map.get(album_id_for_lookup, {})
+                        if not artist_ctx or not artist_ctx.get('name'):
+                            # Fallback: per-track resolution from artists array
+                            _fb_artists = track_info.get('artists', [])
+                            if _fb_artists:
+                                _fb_a = _fb_artists[0]
+                                _fb_name = _fb_a.get('name', str(_fb_a)) if isinstance(_fb_a, dict) else str(_fb_a)
+                            else:
+                                _fb_name = track_info.get('artist', '')
+                            artist_ctx = {'name': _fb_name or 'Unknown Artist'}
+
+                        # Construct minimal album context
+                        # Ensure images are preserved (important for artwork)
+                        album_id = s_album.get('id', 'wishlist_album')
+                        album_ctx = {
+                            'id': album_id,
+                            'name': s_album.get('name'),
+                            'release_date': s_album.get('release_date', ''),
+                            'total_tracks': s_album.get('total_tracks', 1),
+                            'total_discs': wishlist_album_disc_counts.get(album_id, 1),
+                            'album_type': s_album.get('album_type', 'album'),
+                            'images': s_album.get('images', []) # Pass images array directly
+                        }
+
+                        track_info['_explicit_album_context'] = album_ctx
+                        track_info['_explicit_artist_context'] = artist_ctx
+                        track_info['_is_explicit_album_download'] = True
+                        logger.info(f"[Wishlist] Added album context for: '{track_info.get('name')}' -> '{album_ctx['name']}'")
+
+
+                # Add playlist folder mode flag for sync page playlists
+                if batch_playlist_folder_mode:
+                    track_info['_playlist_folder_mode'] = True
+                    track_info['_playlist_name'] = batch_playlist_name
+                    logger.info(f"[Task Creation] Added playlist folder mode for: {track_info.get('name')} → {batch_playlist_name}")
+                else:
+                    logger.debug(f"[Debug] Task Creation - playlist folder mode NOT enabled for: {track_info.get('name')}")
+
+                download_tasks[task_id] = {
+                    'status': 'pending', 'track_info': track_info,
+                    'playlist_id': playlist_id, 'batch_id': batch_id,
+                    'track_index': res['track_index'], 'retry_count': 0,
+                    'cached_candidates': [], 'used_sources': set(),
+                    'status_change_time': time.time(),
+                    'metadata_enhanced': False
+                }
+                download_batches[batch_id]['queue'].append(task_id)
+
+        download_monitor.start_monitoring(batch_id)
+        _start_next_batch_of_downloads(batch_id)
+
+    except Exception as e:
+        logger.error(f"Master worker for batch {batch_id} failed: {e}")
+        import traceback
+        traceback.print_exc()
+
+        is_auto_batch = False
+        with tasks_lock:
+            if batch_id in download_batches:
+                is_auto_batch = download_batches[batch_id].get('auto_initiated', False)
+                download_batches[batch_id]['phase'] = 'error'
+                download_batches[batch_id]['error'] = str(e)
+
+                # Reset YouTube playlist phase to 'discovered' if this is a YouTube playlist on error
+                if playlist_id.startswith('youtube_'):
+                    url_hash = playlist_id.replace('youtube_', '')
+                    if url_hash in youtube_playlist_states:
+                        youtube_playlist_states[url_hash]['phase'] = 'discovered'
+                        logger.error(f"Reset YouTube playlist {url_hash} to discovered phase (error)")
+
+        # Handle auto-initiated wishlist errors - reset flag
+        if is_auto_batch and playlist_id == 'wishlist':
+            logger.error("[Auto-Wishlist] Master worker error - resetting auto-processing flag")
+            global wishlist_auto_processing, wishlist_auto_processing_timestamp
+            with wishlist_timer_lock:
+                wishlist_auto_processing = False
+                wishlist_auto_processing_timestamp = 0
 
 def _run_post_processing_worker(task_id, batch_id):
     """Post-processing verification worker — see core/downloads/post_processing.py."""
@@ -19287,7 +20184,128 @@ def get_all_downloads_unified():
     """Unified downloads list for the centralized Downloads page."""
     try:
         limit = int(request.args.get('limit', 200))
-        return jsonify(_downloads_status.build_unified_downloads_response(limit, _build_status_deps()))
+        status_priority = {
+            'downloading': 0, 'searching': 1, 'post_processing': 2,
+            'queued': 3, 'pending': 3,
+            'completed': 4, 'skipped': 5, 'already_owned': 5,
+            'not_found': 6, 'failed': 7, 'cancelled': 8,
+        }
+
+        items = []
+        with tasks_lock:
+            for task_id, task in download_tasks.items():
+                track_info = task.get('track_info') or {}
+                batch_id = task.get('batch_id', '')
+                batch = download_batches.get(batch_id, {})
+
+                # Extract track metadata — handle all format variations
+                title = ''
+                artist = ''
+                album = ''
+                artwork = ''
+                if isinstance(track_info, dict):
+                    title = track_info.get('title') or track_info.get('name') or track_info.get('track_name') or ''
+
+                    # Artist can be: string, list of strings, list of dicts with 'name'
+                    raw_artist = track_info.get('artist') or track_info.get('artist_name') or track_info.get('artists') or ''
+                    if isinstance(raw_artist, list):
+                        parts = []
+                        for a in raw_artist:
+                            if isinstance(a, dict):
+                                parts.append(a.get('name', ''))
+                            else:
+                                parts.append(str(a))
+                        artist = ', '.join(p for p in parts if p)
+                    elif isinstance(raw_artist, dict):
+                        artist = raw_artist.get('name', '')
+                    else:
+                        artist = str(raw_artist) if raw_artist else ''
+
+                    # Album can be: string or dict with 'name'
+                    raw_album = track_info.get('album') or track_info.get('album_name') or ''
+                    if isinstance(raw_album, dict):
+                        album = raw_album.get('name', '')
+                    else:
+                        album = str(raw_album) if raw_album else ''
+
+                    artwork = track_info.get('artwork_url') or track_info.get('image_url') or track_info.get('album_art') or ''
+                    # Try album images
+                    if not artwork:
+                        raw_alb = track_info.get('album')
+                        if isinstance(raw_alb, dict):
+                            images = raw_alb.get('images') or []
+                            if images and isinstance(images, list) and len(images) > 0:
+                                artwork = images[0].get('url', '') if isinstance(images[0], dict) else str(images[0])
+
+                status = task.get('status', 'queued')
+                # Determine download progress percentage
+                progress = 0
+                if status == 'completed':
+                    progress = 100
+                elif status == 'post_processing':
+                    progress = 95
+                elif status in ('downloading', 'searching'):
+                    # Check live transfer data for real progress
+                    task_filename = task.get('filename') or track_info.get('filename')
+                    task_username = task.get('username') or track_info.get('username')
+                    if task_filename and task_username:
+                        lookup_key = _make_context_key(task_username, task_filename)
+                        live_info = get_cached_transfer_data().get(lookup_key)
+                        if live_info:
+                            progress = live_info.get('percentComplete', 0)
+
+                items.append({
+                    'task_id': task_id,
+                    'title': title,
+                    'artist': artist,
+                    'album': album,
+                    'artwork': artwork,
+                    'status': status,
+                    'progress': progress,
+                    'error': task.get('error_message'),
+                    'batch_id': batch_id,
+                    'batch_name': batch.get('playlist_name') or batch.get('album_name') or '',
+                    'batch_source': batch.get('source_page') or batch.get('initiated_from') or '',
+                    # playlist_id is needed by per-row cancel (cancel_task_v2
+                    # takes playlist_id + track_index). Surfacing it here so
+                    # the frontend doesn't need a second lookup.
+                    'playlist_id': batch.get('playlist_id', ''),
+                    'track_index': task.get('track_index', 0),
+                    'batch_total': len(batch.get('queue', [])),
+                    'timestamp': task.get('status_change_time', 0),
+                    'priority': status_priority.get(status, 9),
+                })
+
+        # Sort: active first (by priority), then by timestamp desc within each group
+        items.sort(key=lambda x: (x['priority'], -x['timestamp']))
+
+        # Build batch summaries for the batch context panel
+        batch_summaries = []
+        with tasks_lock:
+            for bid, batch in download_batches.items():
+                queue = batch.get('queue', [])
+                statuses = [download_tasks[tid]['status'] for tid in queue if tid in download_tasks]
+                batch_summaries.append({
+                    'batch_id': bid,
+                    'playlist_id': batch.get('playlist_id', ''),
+                    'batch_name': batch.get('playlist_name') or batch.get('album_name') or '',
+                    'source_page': batch.get('source_page') or batch.get('initiated_from') or '',
+                    'phase': batch.get('phase', 'unknown'),
+                    'total': len(queue),
+                    'analysis_total': batch.get('analysis_total', len(queue)),
+                    'completed': sum(1 for s in statuses if s in ('completed', 'skipped', 'already_owned')),
+                    'failed': sum(1 for s in statuses if s in ('failed', 'not_found', 'cancelled')),
+                    'active': sum(1 for s in statuses if s in ('downloading', 'searching', 'post_processing')),
+                    'queued': sum(1 for s in statuses if s in ('queued', 'pending')),
+                })
+
+        return jsonify({
+            'success': True,
+            'downloads': items[:limit],
+            'total': len(items),
+            'batches': batch_summaries,
+            'timestamp': time.time(),
+        })
     except Exception as e:
         logger.error(f"Error getting unified downloads: {e}")
         return jsonify({'success': False, 'error': str(e)}), 500
@@ -19704,6 +20722,187 @@ def _check_batch_completion_v2(batch_id):
     return _downloads_lifecycle.check_batch_completion_v2(batch_id, _build_lifecycle_deps())
 
 
+                    # STUCK DETECTION: Force fail tasks that have been in transitional states too long
+                    if task_status == 'searching':
+                        task_age = current_time - task.get('status_change_time', current_time)
+                        if task_age > 600:  # 10 minutes
+                            logger.info(f"⏰ [Stuck Detection V2] Task {task_id} stuck in searching for {task_age:.0f}s - forcing not_found")
+                            task['status'] = 'not_found'
+                            task['error_message'] = f'Search stuck for {int(task_age // 60)} minutes with no results — timed out'
+                            finished_count += 1
+                        else:
+                            retrying_count += 1
+                    elif task_status == 'post_processing':
+                        task_age = current_time - task.get('status_change_time', current_time)
+                        if task_age > 300:  # 5 minutes (post-processing should be fast)
+                            logger.info(f"⏰ [Stuck Detection V2] Task {task_id} stuck in post_processing for {task_age:.0f}s - forcing completion")
+                            task['status'] = 'completed'  # Assume it worked if file verification is taking too long
+                            finished_count += 1
+                        else:
+                            retrying_count += 1
+                    elif task_status == 'downloading':
+                        task_age = current_time - task.get('status_change_time', current_time)
+                        if no_active_workers and task_age > 300:  # 5 minutes with no worker running
+                            logger.info(f"⏰ [Stuck Detection V2] Task {task_id} stuck in downloading for {task_age:.0f}s with no active workers - forcing failed")
+                            task['status'] = 'failed'
+                            task['error_message'] = f'Download stuck for {int(task_age // 60)} minutes with no active worker — timed out'
+                            finished_count += 1
+                        else:
+                            retrying_count += 1
+                    elif task_status in ['completed', 'failed', 'cancelled', 'not_found']:
+                        finished_count += 1
+                    else:
+                        # Catch-all for any other non-terminal state (queued, retrying, etc.)
+                        task_age = current_time - task.get('status_change_time', current_time)
+                        if no_active_workers and task_age > 600:  # 10 minutes with no worker
+                            logger.info(f"⏰ [Stuck Detection V2] Task {task_id} stuck in '{task_status}' for {task_age:.0f}s with no active workers - forcing failed")
+                            task['status'] = 'failed'
+                            task['error_message'] = f'Task stuck in {task_status} for {int(task_age // 60)} minutes with no active worker — timed out'
+                            finished_count += 1
+                        else:
+                            retrying_count += 1
+                else:
+                    # Task ID in queue but not in download_tasks - treat as completed to prevent blocking
+                    logger.warning(f"[Orphaned Task V2] Task {task_id} in queue but not in download_tasks - counting as finished")
+                    finished_count += 1
+            
+            all_tasks_truly_finished = finished_count >= len(queue)
+            has_retrying_tasks = retrying_count > 0
+            
+            logger.warning(f"[Completion Check V2] Batch {batch_id}: tasks_started={all_tasks_started}, workers={no_active_workers}, finished={finished_count}/{len(queue)}, retrying={retrying_count}")
+            
+            if all_tasks_started and no_active_workers and all_tasks_truly_finished and not has_retrying_tasks:
+                # FIXED: Ensure batch is not already marked as complete to prevent duplicate processing
+                if batch.get('phase') != 'complete':
+                    logger.info(f"[Completion Check V2] Batch {batch_id} is complete - marking as finished")
+
+                    # Check if this is an auto-initiated batch
+                    is_auto_batch = batch.get('auto_initiated', False)
+
+                    # Mark batch as complete and set completion timestamp for auto-cleanup
+                    batch['phase'] = 'complete'
+                    batch['completion_time'] = time.time()  # Track when batch completed
+
+                    # Record sync history completion
+                    _record_sync_history_completion(batch_id, batch)
+
+                    # Add activity for batch completion
+                    playlist_name = batch.get('playlist_name', 'Unknown Playlist')
+                    failed_count = len(batch.get('permanently_failed_tracks', []))
+                    successful_downloads = finished_count - failed_count
+                    add_activity_item("", "Download Batch Complete", f"'{playlist_name}' - {successful_downloads} tracks downloaded", "Now")
+
+                    # Emit batch_complete event for automation engine (only if something downloaded)
+                    if successful_downloads > 0:
+                        try:
+                            if automation_engine:
+                                automation_engine.emit('batch_complete', {
+                                    'playlist_name': playlist_name,
+                                    'total_tracks': str(len(queue)),
+                                    'completed_tracks': str(successful_downloads),
+                                    'failed_tracks': str(failed_count),
+                                })
+                        except Exception:
+                            pass
+
+                    # Push discover playlists to media server after downloads complete
+                    playlist_id = batch.get('playlist_id')
+                    if playlist_id and playlist_id.startswith('discover_'):
+                        threading.Thread(
+                            target=_push_discover_playlist_to_server,
+                            args=(batch_id, batch),
+                            daemon=True
+                        ).start()
+                else:
+                    logger.warning(f"[Completion Check V2] Batch {batch_id} already marked complete - skipping duplicate processing")
+                    return True  # Already complete
+
+                # Update YouTube playlist phase to 'download_complete' if this is a YouTube playlist
+                playlist_id = batch.get('playlist_id')
+                if playlist_id and playlist_id.startswith('youtube_'):
+                    url_hash = playlist_id.replace('youtube_', '')
+                    if url_hash in youtube_playlist_states:
+                        youtube_playlist_states[url_hash]['phase'] = 'download_complete'
+                        logger.info(f"[Completion Check V2] Updated YouTube playlist {url_hash} to download_complete phase")
+                
+                # Update Tidal playlist phase to 'download_complete' if this is a Tidal playlist
+                if playlist_id and playlist_id.startswith('tidal_'):
+                    tidal_playlist_id = playlist_id.replace('tidal_', '')
+                    if tidal_playlist_id in tidal_discovery_states:
+                        tidal_discovery_states[tidal_playlist_id]['phase'] = 'download_complete'
+                        logger.info(f"[Completion Check V2] Updated Tidal playlist {tidal_playlist_id} to download_complete phase")
+
+                # Update Deezer playlist phase to 'download_complete' if this is a Deezer playlist
+                if playlist_id and playlist_id.startswith('deezer_'):
+                    deezer_playlist_id = playlist_id.replace('deezer_', '')
+                    if deezer_playlist_id in deezer_discovery_states:
+                        deezer_discovery_states[deezer_playlist_id]['phase'] = 'download_complete'
+                        logger.info(f"[Completion Check V2] Updated Deezer playlist {deezer_playlist_id} to download_complete phase")
+
+                # Update Spotify Public playlist phase to 'download_complete' if this is a Spotify Public playlist
+                if playlist_id and playlist_id.startswith('spotify_public_'):
+                    spotify_public_url_hash = playlist_id.replace('spotify_public_', '')
+                    if spotify_public_url_hash in spotify_public_discovery_states:
+                        spotify_public_discovery_states[spotify_public_url_hash]['phase'] = 'download_complete'
+                        logger.info(f"[Completion Check V2] Updated Spotify Public playlist {spotify_public_url_hash} to download_complete phase")
+
+                logger.info(f"[Completion Check V2] Batch {batch_id} complete - stopping monitor")
+                download_monitor.stop_monitoring(batch_id)
+
+                # REPAIR: Scan all album folders from this batch for track number issues
+                if repair_worker:
+                    repair_worker.process_batch(batch_id)
+
+                # ALBUM CONSISTENCY: Same Picard-style pass as the primary completion path
+                _cons_files = batch.get('_consistency_files', [])
+                if batch.get('is_album_download') and _cons_files and len(_cons_files) >= 2:
+                    _cons_album = batch.get('album_context', {})
+                    _cons_artist = batch.get('artist_context', {})
+                    _cons_album_name = _cons_album.get('name', '') if isinstance(_cons_album, dict) else ''
+                    _cons_artist_name = _cons_artist.get('name', '') if isinstance(_cons_artist, dict) else ''
+                    if _cons_album_name and _cons_artist_name:
+                        try:
+                            _cons_mb_svc = mb_worker.mb_service if mb_worker else None
+                            if _cons_mb_svc and config_manager.get('musicbrainz.embed_tags', True):
+                                from core.album_consistency import run_album_consistency
+                                _cons_result = run_album_consistency(
+                                    file_infos=_cons_files,
+                                    album_name=_cons_album_name,
+                                    artist_name=_cons_artist_name,
+                                    mb_service=_cons_mb_svc,
+                                    total_discs=_cons_album.get('total_discs', 1),
+                                    file_lock_fn=_get_file_lock,
+                                )
+                                if _cons_result.get('success'):
+                                    logger.info(f"[Album Consistency V2] {_cons_result['tags_written']}/{_cons_result['total_files']} files "
+                                          f"harmonized to release {_cons_result.get('release_mbid', '')[:8]}...")
+                                elif _cons_result.get('error'):
+                                    logger.error(f"[Album Consistency V2] Skipped: {_cons_result['error']}")
+                        except Exception as cons_err:
+                            logger.error(f"[Album Consistency V2] Failed (non-fatal): {cons_err}")
+
+        # Process wishlist outside of the lock to prevent threading issues
+        if all_tasks_started and no_active_workers and all_tasks_truly_finished and not has_retrying_tasks:
+            # Call wishlist processing outside the lock
+            if is_auto_batch:
+                logger.info("[Completion Check V2] Processing auto-initiated batch completion")
+                # Use the existing auto-completion function
+                _process_failed_tracks_to_wishlist_exact_with_auto_completion(batch_id)
+            else:
+                logger.info("[Completion Check V2] Processing regular batch completion")
+                # Use the regular completion function
+                _process_failed_tracks_to_wishlist_exact(batch_id)
+            
+            return True  # Batch was completed
+        else:
+            logger.warning(f"[Completion Check V2] Batch {batch_id} not yet complete: finished={finished_count}/{len(queue)}, retrying={retrying_count}, workers={batch['active_count']}")
+            return False  # Batch still in progress
+                
+    except Exception as e:
+        logger.error(f"[Completion Check V2] Error checking batch completion: {e}")
+        import traceback
+        traceback.print_exc()
+        return False
 
 def _add_cancelled_task_to_wishlist(task):
     """Handle a user-cancelled download's wishlist state.
@@ -19987,8 +21186,25 @@ from core.downloads import history as _downloads_history
 
 def _detect_sync_source(playlist_id):
     """Derive the sync source from the playlist_id prefix."""
-    return _downloads_history.detect_sync_source(playlist_id)
-
+    prefix_map = [
+        # Mirrored playlists go through YouTube discovery, so youtube_mirrored_ must be checked first
+        ('auto_mirror_', 'mirrored'), ('youtube_mirrored_', 'mirrored'),
+        ('youtube_', 'youtube'), ('beatport_', 'beatport'),
+        ('tidal_', 'tidal'), ('deezer_', 'deezer'), ('listenbrainz_', 'listenbrainz'),
+        ('spotify_public_', 'spotify_public'), ('discover_', 'discover'),
+        ('seasonal_album_', 'discover'), ('library_redownload_', 'library'),
+        ('issue_download_', 'library'), ('artist_album_', 'spotify'),
+        ('enhanced_search_', 'spotify'), ('spotify_library_', 'spotify'),
+        ('beatport_release_', 'beatport'), ('beatport_chart_', 'beatport'),
+        ('beatport_top100_', 'beatport'), ('beatport_hype100_', 'beatport'),
+        ('beatport_sync_', 'beatport'),
+    ]
+    for prefix, source in prefix_map:
+        if playlist_id.startswith(prefix):
+            return source
+    if playlist_id == 'wishlist':
+        return 'wishlist'
+    return 'spotify'
 
 def _record_sync_history_start(batch_id, playlist_id, playlist_name, tracks,
                                 is_album_download, album_context, artist_context,
@@ -20005,7 +21221,181 @@ def _record_sync_history_start(batch_id, playlist_id, playlist_name, tracks,
 def _record_sync_history_completion(batch_id, batch):
     """Update sync history with completion stats and per-track results.
     NOTE: Called from within tasks_lock context — do NOT acquire tasks_lock here."""
-    _downloads_history.record_sync_history_completion(MusicDatabase(), batch_id, batch)
+    try:
+        analysis_results = batch.get('analysis_results', [])
+        tracks_found = sum(1 for r in analysis_results if r.get('found'))
+        queue = batch.get('queue', [])
+        completed_count = 0
+        failed_count = len(batch.get('permanently_failed_tracks', []))
+
+        logger.warning(f"[SyncHistory] Recording completion for batch {batch_id}: "
+                      f"analysis_results={len(analysis_results)}, tracks_found={tracks_found}, "
+                      f"queue_len={len(queue)}, failed={failed_count}")
+
+        # Build download status map: track_index → status
+        download_status_map = {}
+        for task_id in queue:
+            task = download_tasks.get(task_id, {})
+            ti = task.get('track_index')
+            if ti is not None:
+                download_status_map[ti] = task.get('status', 'unknown')
+            if task.get('status') == 'completed':
+                completed_count += 1
+
+        logger.warning(f"[SyncHistory] Batch {batch_id}: completed_downloads={completed_count}, "
+                      f"download_status_map_size={len(download_status_map)}")
+
+        # Build per-track results from analysis
+        track_results = []
+        for res in analysis_results:
+            track_data = res.get('track', {})
+            artists = track_data.get('artists', [])
+            if artists:
+                first = artists[0]
+                artist_name = first.get('name', first) if isinstance(first, dict) else str(first)
+            else:
+                artist_name = ''
+
+            album = track_data.get('album', '')
+            album_name = album.get('name', '') if isinstance(album, dict) else str(album or '')
+
+            # Extract image URL
+            image_url = ''
+            album_obj = track_data.get('album', {})
+            if isinstance(album_obj, dict):
+                imgs = album_obj.get('images', [])
+                if imgs and isinstance(imgs, list) and len(imgs) > 0:
+                    image_url = imgs[0].get('url', '') if isinstance(imgs[0], dict) else ''
+
+            idx = res.get('track_index', 0)
+            entry = {
+                'index': idx,
+                'name': track_data.get('name', ''),
+                'artist': artist_name,
+                'album': album_name,
+                'image_url': image_url,
+                'duration_ms': track_data.get('duration_ms', 0),
+                'source_track_id': track_data.get('id', ''),
+                'status': 'found' if res.get('found') else 'not_found',
+                'confidence': round(res.get('confidence', 0.0), 3),
+                'matched_track': None,
+                'download_status': download_status_map.get(idx),
+            }
+            track_results.append(entry)
+
+        db = MusicDatabase()
+        updated = db.update_sync_history_completion(batch_id, tracks_found, completed_count, failed_count)
+        logger.warning(f"[SyncHistory] DB update for batch {batch_id}: updated={updated}")
+
+        # Save per-track results
+        if track_results:
+            tr_updated = db.update_sync_history_track_results(batch_id, json.dumps(track_results))
+            logger.warning(f"[SyncHistory] Track results saved for batch {batch_id}: updated={tr_updated}, count={len(track_results)}")
+
+    except Exception as e:
+        logger.warning(f"Failed to record sync history completion: {e}")
+        import traceback
+        traceback.print_exc()
+
+
+def _push_discover_playlist_to_server(batch_id, batch):
+    """After a discover batch completes, push the playlist to the media server.
+    Runs in a background thread. Triggers a scan, waits, then searches for tracks and creates/updates the playlist."""
+    try:
+        playlist_id = batch.get('playlist_id', '')
+        playlist_name = batch.get('playlist_name', '')
+        if not playlist_name:
+            return
+
+        analysis_results = batch.get('analysis_results', [])
+        if not analysis_results:
+            logger.info(f"[DiscoverPush] No analysis results for {playlist_name} - skipping server push")
+            return
+
+        # Build list of tracks that should be in the playlist (found in library OR successfully downloaded)
+        queue = batch.get('queue', [])
+        download_status_map = {}
+        with tasks_lock:
+            for task_id in queue:
+                task = download_tasks.get(task_id, {})
+                ti = task.get('track_index')
+                if ti is not None:
+                    download_status_map[ti] = task.get('status', 'unknown')
+
+        tracks_to_find = []
+        for res in analysis_results:
+            idx = res.get('track_index', 0)
+            found = res.get('found', False)
+            dl_status = download_status_map.get(idx)
+            if found or dl_status == 'completed':
+                track_data = res.get('track', {})
+                artists = track_data.get('artists', [])
+                if artists:
+                    first = artists[0]
+                    artist_name = first.get('name', first) if isinstance(first, dict) else str(first)
+                else:
+                    artist_name = ''
+                tracks_to_find.append({
+                    'index': idx,
+                    'title': track_data.get('name', ''),
+                    'artist': artist_name,
+                })
+
+        if not tracks_to_find:
+            logger.info(f"[DiscoverPush] No tracks to push for {playlist_name}")
+            return
+
+        logger.info(f"[DiscoverPush] {playlist_name}: {len(tracks_to_find)} tracks to push to server, triggering scan first")
+
+        # Trigger a library scan so newly downloaded tracks are indexed
+        if navidrome_client and navidrome_client.is_connected():
+            navidrome_client.trigger_library_scan()
+        elif hasattr(web_scan_manager, 'request_scan'):
+            web_scan_manager.request_scan(f"Discover playlist push: {playlist_name}")
+
+        # Wait for scan to finish (poll every 5s, up to 90s)
+        if navidrome_client and navidrome_client.is_connected():
+            for _ in range(18):
+                time.sleep(5)
+                if not navidrome_client.is_library_scanning():
+                    break
+            logger.info(f"[DiscoverPush] Scan complete, searching for tracks")
+        else:
+            time.sleep(30)
+
+        # Search for each track on the media server
+        matched_server_tracks = []
+        if navidrome_client and navidrome_client.is_connected():
+            for t in tracks_to_find:
+                results = navidrome_client.search_tracks(t['title'], t['artist'], limit=5)
+                if results:
+                    # Use the first result's underlying NavidromeTrack for playlist creation
+                    best = results[0]
+                    nav_track = getattr(best, '_original_navidrome_track', None)
+                    if nav_track:
+                        matched_server_tracks.append(nav_track)
+                        logger.debug(f"[DiscoverPush] Matched: '{t['title']}' by '{t['artist']}' → {best.id}")
+                    else:
+                        matched_server_tracks.append(best)
+                else:
+                    logger.info(f"[DiscoverPush] No match for: '{t['title']}' by '{t['artist']}'")
+
+        if not matched_server_tracks:
+            logger.warning(f"[DiscoverPush] No tracks matched on server for {playlist_name}")
+            return
+
+        logger.info(f"[DiscoverPush] Pushing {len(matched_server_tracks)}/{len(tracks_to_find)} tracks to '{playlist_name}' on server")
+        success = navidrome_client.update_playlist(playlist_name, matched_server_tracks)
+        if success:
+            logger.info(f"[DiscoverPush] Successfully pushed '{playlist_name}' to server with {len(matched_server_tracks)} tracks")
+        else:
+            logger.warning(f"[DiscoverPush] Failed to push '{playlist_name}' to server")
+
+    except Exception as e:
+        logger.error(f"[DiscoverPush] Error pushing playlist to server: {e}")
+        import traceback
+        traceback.print_exc()
+
 
 # ===============================
 # == SERVER PLAYLIST MANAGER ==
@@ -20999,6 +22389,8 @@ def start_missing_tracks_process(playlist_id):
         _source_page = 'wishlist'
     elif is_album_download:
         _source_page = 'album'
+    elif playlist_id.startswith('discover_') or playlist_id.startswith('seasonal_'):
+        _source_page = 'discover'
     elif playlist_id.startswith('youtube_'):
         _source_page = 'sync'
     else:
@@ -25869,23 +27261,35 @@ def convert_youtube_results_to_spotify_tracks(discovery_results):
 from core.discovery import sync as _discovery_sync
 
 
-def _build_sync_deps():
-    """Build the SyncDeps bundle from web_server.py globals on each call."""
-    return _discovery_sync.SyncDeps(
-        config_manager=config_manager,
-        sync_service=sync_service,
-        media_server_engine=media_server_engine,
-        automation_engine=automation_engine,
-        run_async=run_async,
-        record_sync_history_start=_record_sync_history_start,
-        update_automation_progress=_update_automation_progress,
-        update_and_save_sync_status=_update_and_save_sync_status,
-        sync_states=sync_states,
-        sync_lock=sync_lock,
-        process_wishlist_automatically=_process_wishlist_automatically,
-        run_playlist_organize_download=_run_playlist_organize_download,
-        is_wishlist_actually_processing=is_wishlist_actually_processing,
-    )
+    # Record sync history start (skip for re-syncs triggered from history)
+    _is_resync = playlist_id.startswith('resync_')
+    _resync_entry_id = None
+    sync_batch_id = f"sync_{playlist_id}_{int(time.time())}"
+    if _is_resync:
+        # Extract the original entry ID from resync_{entryId}_{timestamp}
+        try:
+            _resync_entry_id = int(playlist_id.split('_')[1])
+        except (IndexError, ValueError):
+            pass
+    else:
+        # Derive source_page from playlist_id prefix
+        if playlist_id.startswith('discover_') or playlist_id.startswith('seasonal_'):
+            _source_page = 'discover'
+        elif playlist_id.startswith('listenbrainz_') or playlist_id.startswith('discover_listenbrainz_'):
+            _source_page = 'discover'
+        else:
+            _source_page = 'sync'
+        _record_sync_history_start(
+            batch_id=sync_batch_id,
+            playlist_id=playlist_id,
+            playlist_name=playlist_name,
+            tracks=tracks_json,
+            is_album_download=False,
+            album_context=None,
+            artist_context=None,
+            playlist_folder_mode=False,
+            source_page=_source_page
+        )
 
 
 def _run_sync_task(
@@ -30281,6 +31685,9 @@ def refresh_discover_data():
 
         logger.info(f"[Discover Refresh] Complete! Recent albums: {len(recent_albums)}, Release Radar: {len(release_radar)} tracks, Discovery Weekly: {len(discovery_weekly)} tracks")
 
+        # Auto-sync any "Keep it updated" playlists
+        _auto_sync_discover_playlists(refresh_pid, active_source)
+
         return jsonify({
             "success": True,
             "message": "Discover data refreshed",
@@ -30295,6 +31702,269 @@ def refresh_discover_data():
         import traceback
         traceback.print_exc()
         return jsonify({"success": False, "error": str(e)}), 500
+
+
+def _auto_sync_discover_playlists(profile_id, active_source):
+    """Auto-sync Discover playlists that have 'Keep it updated' enabled."""
+    try:
+        playlist_configs = {
+            'release_radar': 'Fresh Tape',
+            'discovery_weekly': 'The Archives',
+            'seasonal_playlist': 'Seasonal Mix',
+            'popular_picks': 'Popular Picks',
+            'hidden_gems': 'Hidden Gems',
+            'discovery_shuffle': 'Discovery Shuffle',
+            'familiar_favorites': 'Familiar Favorites',
+        }
+
+        for ptype, pname in playlist_configs.items():
+            if not config_manager.get(f'discover.auto_sync.{ptype}', False):
+                continue
+
+            logger.info(f"[Auto-Sync] {pname} has 'Keep it updated' enabled, triggering sync...")
+
+            try:
+                database = get_database()
+                tracks = []
+
+                if ptype in ('release_radar', 'discovery_weekly'):
+                    curated_ids = database.get_curated_playlist(f'{ptype}_{active_source}', profile_id=profile_id)
+                    if not curated_ids:
+                        curated_ids = database.get_curated_playlist(ptype, profile_id=profile_id)
+                    if curated_ids:
+                        pool_tracks = database.get_discovery_pool_tracks(limit=5000, new_releases_only=False, source=active_source, profile_id=profile_id)
+                        tracks_by_id = {}
+                        for track in pool_tracks:
+                            tid = None
+                            if active_source == 'spotify' and track.spotify_track_id:
+                                tid = track.spotify_track_id
+                            elif active_source == 'deezer' and getattr(track, 'deezer_track_id', None):
+                                tid = track.deezer_track_id
+                            elif active_source == 'itunes' and track.itunes_track_id:
+                                tid = track.itunes_track_id
+                            if tid:
+                                tracks_by_id[tid] = track
+
+                        for track_id in curated_ids:
+                            if track_id in tracks_by_id:
+                                t = tracks_by_id[track_id]
+                                tracks.append({
+                                    'id': t.spotify_track_id or getattr(t, 'deezer_track_id', None) or t.itunes_track_id or '',
+                                    'name': t.track_name,
+                                    'artists': [t.artist_name],
+                                    'album': t.album_name,
+                                    'duration_ms': t.duration_ms or 0
+                                })
+                elif ptype == 'seasonal_playlist':
+                    from core.seasonal_discovery import SeasonalDiscoveryService
+                    seasonal_svc = SeasonalDiscoveryService(database)
+                    season_data = seasonal_svc.get_current_season_playlist()
+                    if season_data and season_data.get('tracks'):
+                        tracks = [{
+                            'id': t.get('spotify_track_id', ''),
+                            'name': t.get('track_name', ''),
+                            'artists': [t.get('artist_name', '')],
+                            'album': t.get('album_name', ''),
+                            'duration_ms': t.get('duration_ms', 0)
+                        } for t in season_data['tracks']]
+                else:
+                    from core.personalized_playlists import PersonalizedPlaylistsService
+                    service = PersonalizedPlaylistsService(database)
+                    method_map = {
+                        'popular_picks': service.get_popular_picks,
+                        'hidden_gems': service.get_hidden_gems,
+                        'discovery_shuffle': service.get_discovery_shuffle,
+                        'familiar_favorites': service.get_familiar_favorites,
+                    }
+                    if ptype in method_map:
+                        raw_tracks = method_map[ptype](limit=50)
+                        tracks = [{
+                            'id': t.get('spotify_track_id', ''),
+                            'name': t.get('track_name', ''),
+                            'artists': [t.get('artist_name', '')],
+                            'album': t.get('album_name', ''),
+                            'duration_ms': t.get('duration_ms', 0)
+                        } for t in raw_tracks]
+
+                if tracks:
+                    virtual_id = f'discover_{ptype}'
+                    with sync_lock:
+                        if virtual_id in active_sync_workers and not active_sync_workers[virtual_id].done():
+                            logger.info(f"[Auto-Sync] {pname} already syncing, skipping")
+                            continue
+                        sync_states[virtual_id] = {"status": "starting", "progress": {}}
+                        future = sync_executor.submit(_run_sync_task, virtual_id, pname, tracks, None, profile_id, '')
+                        active_sync_workers[virtual_id] = future
+                    logger.info(f"[Auto-Sync] Started sync for {pname} with {len(tracks)} tracks")
+                else:
+                    logger.info(f"[Auto-Sync] No tracks available for {pname}, skipping")
+
+            except Exception as e:
+                logger.error(f"[Auto-Sync] Error syncing {pname}: {e}")
+
+    except Exception as e:
+        logger.error(f"[Auto-Sync] Error in auto-sync: {e}")
+
+
+@app.route('/api/discover/synced-playlists', methods=['GET'])
+def get_discover_synced_playlists():
+    """Get all Discover playlist types with sync status and auto-update config."""
+    try:
+        database = get_database()
+        active_source = _get_active_discovery_source()
+        pid = get_current_profile_id()
+
+        playlist_types = [
+            {'type': 'release_radar', 'name': 'Fresh Tape', 'description': 'New drops from recent releases', 'icon': '🎵'},
+            {'type': 'discovery_weekly', 'name': 'The Archives', 'description': 'Curated from your collection', 'icon': '📚'},
+            {'type': 'seasonal_playlist', 'name': 'Seasonal Mix', 'description': 'Seasonal curated playlist', 'icon': '🌿'},
+            {'type': 'popular_picks', 'name': 'Popular Picks', 'description': 'Most popular from your discovery pool', 'icon': '🔥'},
+            {'type': 'hidden_gems', 'name': 'Hidden Gems', 'description': 'Underappreciated gems from your pool', 'icon': '💎'},
+            {'type': 'discovery_shuffle', 'name': 'Discovery Shuffle', 'description': 'Random tracks from discovery', 'icon': '🔀'},
+            {'type': 'familiar_favorites', 'name': 'Familiar Favorites', 'description': 'Familiar tracks you love', 'icon': '❤️'},
+        ]
+
+        # Check if discovery pool has any data (needed for personalized playlists)
+        try:
+            with database._get_connection() as conn:
+                pool_count = conn.execute(
+                    "SELECT COUNT(*) FROM discovery_pool WHERE source = ?", (active_source,)
+                ).fetchone()[0]
+        except Exception:
+            pool_count = 0
+
+        results = []
+        for pt in playlist_types:
+            ptype = pt['type']
+
+            # Get track count
+            track_count = 0
+            if ptype in ('release_radar', 'discovery_weekly'):
+                curated_ids = database.get_curated_playlist(f'{ptype}_{active_source}', profile_id=pid)
+                if not curated_ids:
+                    curated_ids = database.get_curated_playlist(ptype, profile_id=pid)
+                track_count = len(curated_ids) if curated_ids else 0
+            elif ptype == 'seasonal_playlist':
+                from core.seasonal_discovery import SeasonalDiscoveryService
+                try:
+                    seasonal_svc = SeasonalDiscoveryService(database)
+                    season_data = seasonal_svc.get_current_season_playlist()
+                    track_count = len(season_data.get('tracks', [])) if season_data else 0
+                except Exception:
+                    track_count = 0
+            else:
+                # Personalized playlists come from the discovery pool
+                # familiar_favorites is not implemented — always report 0
+                if ptype == 'familiar_favorites':
+                    track_count = 0
+                elif pool_count > 0:
+                    track_count = min(50, pool_count)
+                else:
+                    track_count = 0
+
+            # Get last sync info
+            virtual_id = f'discover_{ptype}'
+            sync_status = 'never'
+            last_synced = None
+            matched_tracks = 0
+            total_sync_tracks = 0
+
+            with sync_lock:
+                state = sync_states.get(virtual_id)
+                if state and state.get('status') in ('syncing', 'starting'):
+                    sync_status = 'syncing'
+
+            # Also check download_batches for active discover batches
+            active_batch_id = None
+            if sync_status == 'never':
+                with tasks_lock:
+                    for bid, b in download_batches.items():
+                        if b.get('playlist_id') == virtual_id and b.get('phase') not in ('complete', 'error', 'cancelled'):
+                            sync_status = 'syncing'
+                            active_batch_id = bid
+                            break
+
+            if sync_status == 'never':
+                try:
+                    entries, _ = database.get_sync_history(source='discover', page=1, limit=100)
+                    for entry in entries:
+                        if entry.get('playlist_name') == pt['name'] or entry.get('playlist_id', '').startswith(virtual_id):
+                            sync_status = 'synced'
+                            last_synced = entry.get('completed_at') or entry.get('started_at')
+                            matched_tracks = (entry.get('tracks_found') or 0) + (entry.get('tracks_downloaded') or 0)
+                            total_sync_tracks = entry.get('total_tracks') or 0
+                            break
+                except Exception:
+                    pass
+
+            auto_update = config_manager.get(f'discover.auto_sync.{ptype}', False)
+
+            # Use actual track count from last sync if available (curated_playlist can be stale)
+            if total_sync_tracks > 0:
+                track_count = total_sync_tracks
+
+            results.append({
+                **pt,
+                'track_count': track_count,
+                'sync_status': sync_status,
+                'last_synced': last_synced,
+                'matched_tracks': matched_tracks,
+                'total_sync_tracks': total_sync_tracks,
+                'auto_update': bool(auto_update),
+                'virtual_id': virtual_id,
+                'active_batch_id': active_batch_id,
+            })
+
+        source_labels = {
+            'spotify': 'Spotify', 'deezer': 'Deezer', 'itunes': 'iTunes/Apple Music',
+            'discogs': 'Discogs', 'hydrabase': 'Hydrabase'
+        }
+        has_any_data = pool_count > 0 or any(r['track_count'] > 0 for r in results)
+
+        return jsonify({
+            "success": True,
+            "playlists": results,
+            "source": active_source,
+            "source_label": source_labels.get(active_source, active_source),
+            "has_data": has_any_data,
+        })
+    except Exception as e:
+        logger.error(f"Error getting discover synced playlists: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route('/api/discover/auto-update', methods=['POST', 'GET'])
+def manage_discover_auto_update():
+    """Toggle or get auto-update settings for Discover playlists."""
+    valid_types = ['release_radar', 'discovery_weekly', 'seasonal_playlist',
+                   'popular_picks', 'hidden_gems', 'discovery_shuffle', 'familiar_favorites']
+
+    if request.method == 'GET':
+        settings = {}
+        for ptype in valid_types:
+            settings[ptype] = bool(config_manager.get(f'discover.auto_sync.{ptype}', False))
+        # Also include any listenbrainz_* auto-sync settings
+        all_config = config_manager.get('discover.auto_sync', {})
+        if isinstance(all_config, dict):
+            for key, val in all_config.items():
+                if key.startswith('listenbrainz_'):
+                    settings[key] = bool(val)
+        return jsonify({"success": True, "settings": settings})
+
+    data = request.get_json()
+    playlist_type = data.get('playlist_type')
+    enabled = data.get('enabled', False)
+
+    is_lb_type = playlist_type and playlist_type.startswith('listenbrainz_')
+    if playlist_type not in valid_types and not is_lb_type:
+        return jsonify({"success": False, "error": f"Invalid playlist type: {playlist_type}"}), 400
+
+    config_manager.set(f'discover.auto_sync.{playlist_type}', bool(enabled))
+    logger.info(f"Discover auto-sync for {playlist_type}: {'enabled' if enabled else 'disabled'}")
+
+    return jsonify({"success": True, "playlist_type": playlist_type, "enabled": bool(enabled)})
 
 
 @app.route('/api/discover/diagnose', methods=['GET'])
@@ -30369,6 +32039,66 @@ def diagnose_discover_data():
 # ========================================
 # SEASONAL DISCOVERY ENDPOINTS
 # ========================================
+
+@app.route('/api/discover/seasonal/current-playlist', methods=['GET'])
+def get_current_seasonal_playlist():
+    """Auto-detect current season and return its playlist tracks"""
+    try:
+        from core.seasonal_discovery import get_seasonal_discovery_service, SEASONAL_CONFIG
+
+        database = get_database()
+        seasonal_service = get_seasonal_discovery_service(spotify_client, database)
+        current_season = seasonal_service.get_current_season()
+
+        if not current_season or current_season not in SEASONAL_CONFIG:
+            return jsonify({"success": True, "tracks": []})
+
+        active_source = _get_active_discovery_source()
+        track_ids = seasonal_service.get_curated_seasonal_playlist(current_season, source=active_source)
+
+        if not track_ids:
+            return jsonify({"success": True, "tracks": []})
+
+        track_id_col = 'spotify_track_id' if active_source == 'spotify' else 'itunes_track_id'
+        tracks = []
+        with database._get_connection() as conn:
+            cursor = conn.cursor()
+            for track_id in track_ids:
+                cursor.execute("""
+                    SELECT spotify_track_id, track_name, artist_name, album_name,
+                           album_cover_url, duration_ms, popularity, track_data_json
+                    FROM seasonal_tracks WHERE spotify_track_id = ? AND source = ?
+                """, (track_id, active_source))
+                result = cursor.fetchone()
+                if not result:
+                    cursor.execute(f"""
+                        SELECT {track_id_col} as spotify_track_id, track_name, artist_name, album_name,
+                               album_cover_url, duration_ms, popularity, track_data_json
+                        FROM discovery_pool WHERE {track_id_col} = ? AND source = ?
+                    """, (track_id, active_source))
+                    result = cursor.fetchone()
+                if result:
+                    track_dict = dict(result)
+                    if track_dict.get('track_data_json'):
+                        try:
+                            import json
+                            track_dict['track_data_json'] = json.loads(track_dict['track_data_json'])
+                        except:
+                            pass
+                    tracks.append(track_dict)
+
+        config = SEASONAL_CONFIG[current_season]
+        return jsonify({
+            "success": True,
+            "season": current_season,
+            "name": config['name'],
+            "tracks": tracks
+        })
+    except Exception as e:
+        logger.error(f"Error getting current seasonal playlist: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({"success": False, "error": str(e)}), 500
 
 @app.route('/api/discover/seasonal/current', methods=['GET'])
 def get_current_seasonal_content():
@@ -31986,7 +33716,8 @@ def _get_lb_discover_playlists(playlist_type):
                 "creator": playlist['creator'],
                 "track_count": playlist.get('track_count', 0),
                 "annotation": playlist.get('annotation', {}),
-                "track": []
+                "track": [],
+                "track_count": playlist.get('track_count', 0),
             }
         })
 

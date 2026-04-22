@@ -3741,6 +3741,11 @@ function initializeSyncPage() {
                 loadMirroredPlaylists();
             }
 
+            // Auto-load SoulSync Discover playlists on first tab activation
+            if (tabId === 'discover' && !discoverSyncPlaylistsLoaded) {
+                loadDiscoverSyncPlaylists();
+            }
+
             // Auto-load server playlists on first tab activation
             if (tabId === 'server' && !window._serverPlaylistsLoaded) {
                 window._serverPlaylistsLoaded = true;

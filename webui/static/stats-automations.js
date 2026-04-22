@@ -458,10 +458,7 @@ function importFileSubmit() {
 // ── Mirrored Playlists ────────────────────────────────────────────────
 
 let mirroredPlaylistsLoaded = false;
-// Auto-Sync state + functions moved to webui/static/auto-sync.js; declared
-// as globals there so the older mirrored-playlist render path below can
-// still reach `mirroredPipelinePollers`, `runMirroredPlaylistPipeline`,
-// `editMirroredSourceRef`, `getMirroredSourceRef`, and `pollMirroredPipelineStatus`.
+let discoverSyncPlaylistsLoaded = false;
 
 /**
  * Fire-and-forget helper: send parsed playlist data to be mirrored on the backend.

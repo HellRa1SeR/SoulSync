@@ -2438,14 +2438,14 @@ let _adlFetchCount = 0; // used to rate-limit periodic quarantine refresh
 const _batchColorMap = {};
 const _batchCompletedAt = {}; // batch_id -> timestamp when first seen as complete
 let _batchColorNext = 0;
+const _BATCH_COLOR_COUNT = 16;
 
 function _getBatchColor(batchId) {
     if (!batchId) return -1;
     if (_batchColorMap[batchId] === undefined) {
-        // Deterministic color from batch_id hash for consistency across reloads
-        let hash = 0;
-        for (let i = 0; i < batchId.length; i++) hash = ((hash << 5) - hash + batchId.charCodeAt(i)) | 0;
-        _batchColorMap[batchId] = Math.abs(hash) % 8;
+        // Assign colors sequentially so no duplicates until all 16 are used
+        _batchColorMap[batchId] = _batchColorNext % _BATCH_COLOR_COUNT;
+        _batchColorNext++;
     }
     return _batchColorMap[batchId];
 }
@@ -3725,14 +3725,8 @@ function _adlRenderBatchPanel() {
         let phaseText = '';
         let phaseIcon = '';
         if (batch.phase === 'queued') {
-            // Batch is in the executor queue waiting for a worker slot.
-            // ``missing_download_executor`` has max_workers=3 by default,
-            // so wishlist runs with >3 sub-batches park the rest at this
-            // state until a worker frees up. Pre-fix this status rendered
-            // as "Analyzing..." which misled users into thinking 26
-            // batches were all working when really only 3 were running.
             phaseText = 'Queued';
-            phaseIcon = '<span style="margin-right:4px;opacity:0.6">⏳</span>';
+            phaseIcon = '<span style="color:#eab308;margin-right:4px">⏳</span>';
         } else if (batch.phase === 'analysis') {
             phaseText = 'Analyzing...';
             phaseIcon = '<span class="adl-spinner" style="margin-right:4px"></span>';

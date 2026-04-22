@@ -3704,7 +3704,11 @@ function _adlRenderBatchPanel() {
             : Math.round((done / total) * 100);
         const hasFailed = batch.failed > 0;
         const isTerminal = batch.phase === 'complete' || batch.phase === 'cancelled' || batch.phase === 'error';
-        const isActive = (batch.phase === 'downloading' && batch.active > 0) || batch.phase === 'album_downloading';
+        const isActive = batch.phase === 'downloading' && batch.active > 0;
+        const isAnalyzing = batch.phase === 'analysis';
+        const analysisTotal = batch.analysis_total || 0;
+        const analysisProcessed = batch.analysis_processed || 0;
+        const analysisPct = analysisTotal > 0 ? Math.round((analysisProcessed / analysisTotal) * 100) : 0;
 
         // Fade progress for completing batches
         let fadeStyle = '';
@@ -3728,7 +3732,7 @@ function _adlRenderBatchPanel() {
             phaseText = 'Queued';
             phaseIcon = '<span style="color:#eab308;margin-right:4px">⏳</span>';
         } else if (batch.phase === 'analysis') {
-            phaseText = 'Analyzing...';
+            phaseText = analysisTotal > 0 ? `Analyzing ${analysisProcessed}/${analysisTotal}...` : 'Analyzing...';
             phaseIcon = '<span class="adl-spinner" style="margin-right:4px"></span>';
         } else if (batch.phase === 'album_downloading') {
             phaseText = _adlBundleProgressText(albumBundle);
@@ -3868,10 +3872,8 @@ function _adlRenderBatchPanel() {
                     </span>
                 </div>
             </div>
-            <div class="adl-batch-segbar">
-                <div class="adl-batch-seg seg-done" style="width:${segDone}%"></div>
-                <div class="adl-batch-seg seg-fail" style="width:${segFail}%"></div>
-                <div class="adl-batch-seg seg-active${isActive ? ' shimmer' : ''}" style="width:${segActive}%"></div>
+            <div class="adl-batch-progress">
+                <div class="adl-batch-progress-fill${hasFailed ? ' has-failed' : ''}" style="width:${isAnalyzing ? analysisPct : pct}%"></div>
             </div>
             ${statLine}
             <div class="adl-batch-tracks">${tracksHtml}</div>

@@ -19305,7 +19305,7 @@ def _build_post_processing_deps():
                     'listenbrainz_', 'beatport_',
                 )
                 if playlist_id and playlist_id.startswith(_push_prefixes):
-                    database.update_sync_history_push_status(batch_id, 'pending')
+                    get_database().update_sync_history_push_status(batch_id, 'pending')
                     threading.Thread(
                         target=_push_playlist_to_server,
                         args=(batch_id, batch),
@@ -20475,6 +20475,8 @@ def start_playlist_missing_downloads(playlist_id):
                 'active_count': 0,
                 'max_concurrent': _get_max_concurrent(),
                 'queue_index': 0,
+                'playlist_id': playlist_id,
+                'playlist_name': playlist_name,
                 # Track state management (replicating sync.py)
                 'permanently_failed_tracks': [],
                 'cancelled_tracks': set(),
@@ -21389,7 +21391,7 @@ def _check_batch_completion_v2(batch_id):
                         'listenbrainz_', 'beatport_',
                     )
                     if playlist_id and playlist_id.startswith(_push_prefixes):
-                        database.update_sync_history_push_status(batch_id, 'pending')
+                        get_database().update_sync_history_push_status(batch_id, 'pending')
                         threading.Thread(
                             target=_push_playlist_to_server,
                             args=(batch_id, batch),
@@ -23057,6 +23059,8 @@ def start_missing_downloads():
                 'active_count': 0,
                 'max_concurrent': _get_max_concurrent(),
                 'queue_index': 0,
+                'playlist_id': playlist_id,
+                'playlist_name': 'Legacy Modal',
                 # Track state management (replicating sync.py)
                 'permanently_failed_tracks': [],
                 'cancelled_tracks': set(),

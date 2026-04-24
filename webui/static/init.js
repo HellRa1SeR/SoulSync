@@ -2873,6 +2873,8 @@ async function loadPageData(pageId) {
                     delete discoverSyncPollers[key];
                 }
             }
+            // Reset so discover tab refetches on next visit
+            discoverSyncPlaylistsLoaded = false;
         }
         switch (pageId) {
             case 'dashboard':

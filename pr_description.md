@@ -1,44 +1,58 @@
-# soulsync 2.8.0 — `dev` → `main`
+# 2.7.2
 
-mostly a quality + reliability release. the headline is a big cleanup of the **Unverified review queue** (it stops inflating and self-heals), a new **Preview Clip Cleanup** tool, smarter **Album Completeness** for split/fragmented albums, and a real pass on **dashboard performance** (especially Firefox/Zen). plus a pile of reported fixes.
+a big feature + fix pass on top of 2.7.1 — playlist-folder mirroring, a redesigned quality-upgrade finder, smarter artist enrichment, better tidal/youtube/soundcloud imports, M3U export, and a stack of issue fixes.
 
----
+## organize playlists into folders
 
-## what's new
+soulsync can now mirror each playlist into its own folder on disk, so external players (plex / jellyfin / music assistant) see them as real folders:
 
-### Preview Clip Cleanup (new Tools job)
-the HiFi source sometimes hands back a ~30-second **preview clip** instead of the full song, and it lands looking like a normal track. the new job scans your short tracks, checks how long each one *should* be from its metadata source, and flags the previews. approve a finding and it deletes the clip, drops it from the library, and re-wishlists the full version. each finding has a **▶ Play** button + a file-length-vs-real-length readout so you can confirm it's busted before approving. conservative by design — genuine short tracks and anything it can't verify are left alone.
+- **symlink or copy** — symlink for no extra disk, copy if you want standalone files.
+- **self-maintaining** — rebuilds after every sync and prunes tracks you removed; separate output root + a manual rebuild button in settings.
+- album / single / playlist downloads all share the exact same post-processing, so the folder view always matches the library.
 
-### the Unverified queue stops inflating + self-heals (#934)
-big one for anyone who saw thousands of "unverified" rows. the AcoustID scan was creating a fresh history row every run and leaving already-verified files stuck as "unverified" (a frozen import-time path that stopped matching once the file moved). now:
-- scans no longer duplicate rows and heal on the spot, and
-- a one-time **reconcile** on startup clears the existing backlog from your library's truth — no re-scan needed, including human-verified files a scan skips, and
-- a **🧹 Clean orphaned** button removes dead rows whose file is genuinely gone (with a safety gate that refuses to run if your library looks offline).
-the Unverified review rows also got the nicer Quarantine-style cards (artwork, inline details). *(thanks @nick2000713 for #938.)*
+## quality upgrade finder (replaces the old quality scanner)
 
-### Album Completeness handles split albums (#936, #929, #931)
-a physical album split across multiple library rows used to show every fragment as falsely "incomplete." it now groups the validated fragments into one logical album and emits a single correct finding — grouping by a shared id **and** validating at the track level, so unrelated rows never get fused. also recognizes MusicBrainz as a readable album source. *(thanks @ragnarlotus.)*
+the old Quality Scanner judged quality by file extension only, ignored the bitrate profile, and auto-dumped everything into the wishlist with no review. it's gone — replaced by a proper **Library Maintenance job** (off by default):
 
-### Clear Completed is back on the Downloads page
-since completed downloads now persist across restart, the **Clear Completed** button had gone missing for them. it's back — it clears the live list *and* the persisted history so the page actually empties and stays empty (your files are untouched).
+- **bitrate-aware** — judges each track by format *and* bitrate against your quality profile, so a 320 mp3 passes a flac+320+256 profile and a 128 mp3 doesn't (enabling mp3-320/256 finally counts).
+- **findings, not auto-action** — it scans (watchlist or whole library), finds below-quality tracks, and creates reviewable findings. nothing hits the wishlist until you Apply.
+- **exact matching** — resolves the better version by the most precise identity available: the source track-ID embedded in the file → ISRC → the album's tracklist (by stored album-id or album search) → name search. carries real album context, and the fuzzy steps reject wrong-length cuts (live/edit/remix).
+- skips tracks it already proposed, so re-runs are cheap. transcode/fake-lossless detection stays with the existing Fake Lossless Detector job.
 
----
+## smarter artist enrichment (#868)
 
-## fixes
+enrichment matched artists by name only — so for a common name (there are ~5 "Rone"s) it grabbed whichever the source ranked first, often the wrong one, which then drove a wrong/sparse library discography. now when multiple same-name artists clear the name gate, it picks the one whose catalog **overlaps the albums you actually own**. wired into Spotify (+ no-auth), iTunes, Deezer, and MusicBrainz. "click to re-match" now actually re-resolves (it used to re-confirm the wrong id).
 
-- **pasted YouTube cookies threw `unsupported browser: "custom"` (Docker)** — the client passed the "Paste cookies.txt" mode through as a browser name instead of using the cookies file. now it loads the pasted `cookies.txt` correctly — the only auth path that works on a headless/Docker box. *(thanks HellRa1SeR.)*
-- **longer remasters quarantined as "truncated" (#937)** — the duration check was symmetric, so a remaster running a few seconds *longer* than the metadata got rejected like a truncated download. it's asymmetric now: short files stay strict, longer versions get room. *(thanks @diegocade1.)*
-- **"Add to Wishlist" from an artist discography was painfully slow** — ~15–30s *per track* on a large library, because the per-track library-ownership check fell through to a full-table fuzzy scan. it now matches in-memory against the artist's tracks once — effectively instant.
-- **wishlist art was blank for re-downloads / preview re-fetches** — library-sourced items stored a relative media-server path that doesn't render in a browser. they're normalized on read now, so album + artist art show up (fixes already-saved items too).
-- **watchlist didn't record automatic scans (#933)** + **watchlist fused different editions of an album as one.**
-- **manual search:** a pasted Qobuz/Tidal track now floats to the top of results (#932).
-- **Popular Picks came up empty on Deezer** — a popularity-threshold scale mismatch.
+## tidal playlist discovery (#867)
 
----
+- discovery used to show only a subset of a playlist's tracks (a 59-track playlist surfaced ~21) — now it shows them all, driven by the authoritative backend results, and `get_playlist` chunks its track-ID fetch to Tidal's page cap so nothing's dropped.
+- the discovery modal opens **instantly** instead of hanging ~10s on a blocking pre-fetch, and it's no longer interactable while it's still loading.
 
-## performance + UI
+## export server playlists as M3U
 
-- **dashboard GPU usage, especially on Firefox/Zen (#935)** — frosted-glass blur, cursor-glow blobs, and the worker-orb animation were repainting every frame. trimmed the worst offenders, made the orb loop hold a steady framerate on Firefox instead of dropping to ~1fps, and set **Background Particles OFF by default**. the dashboard system-memory tile now also shows SoulSync's own RAM.
-- **bounded memory growth (#802)** — browsing every page used to climb RSS into the GBs (plexapi's XML trees deferring GC) and could lock the app up. a lightweight sweeper now collects + hands memory back to the OS as it grows, so it sawtooths and settles instead of climbing.
+one-click **Export M3U** button in the Server Playlists compare/editor toolbar — writes a standard `.m3u` and downloads it to your browser (great for music assistant). resolved via one bulk db read so it doesn't hang under active enrichment/scan writes.
 
----
+## better youtube & soundcloud imports
+
+- **#863** — youtube / youtube-music playlists that imported as "Unknown Artist" now recover the real artist from the track's music metadata, the "Artist - Title" pattern, or the uploading channel (recovery runs in the async discovery worker so the parse stays fast).
+- **#865** — paste a soundcloud track link, including unlisted / private share urls, into manual search to download it directly.
+
+## watchlist & playlists
+
+- **follow-only watchlist** — per-artist "auto-download" toggle (on by default). off = scans still discover/surface new releases, they just don't auto-add to the wishlist.
+- **rename mirrored playlists** — a custom name that changes the display + sync name, survives upstream refreshes, and still tracks the same server playlist.
+
+## more requested features
+
+- **export your roster** — one button + scope selector dumps the watchlist and/or whole library roster to JSON / CSV / text.
+- **ReplayGain Filler (#437)** and **Empty Folder Cleaner** library-maintenance jobs.
+- **#857** — custom in-container completed-download path for Torrent / Usenet so finished grabs in a category subfolder are found.
+- **HiFi instances** — Restore Defaults button, bigger tap targets, and a confirmed-working instance auto-pushed to existing installs (thanks Sokhi).
+- **Aria2** added to the torrent client list; artist detail **"DB Record"** inspector.
+
+## bug fixes
+
+- **#859** — a hung database update self-heals now instead of wedging on "Starting..." forever.
+- **#862** — Library Reorganize finally works on media-server libraries (falls back to tag mode when an album has no source ID).
+- **spotify (no-auth)** — shows as connected and the dashboard test reports it correctly, instead of claiming a deezer fallback.
+- **navidrome** reconnects itself instead of latching "disconnected"; the orphan detector hard-bails on a mass-orphan flood; plus more #852 lock-screen hardening and login-password management in Manage Profiles.

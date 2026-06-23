@@ -349,9 +349,11 @@ class YouTubeClient(DownloadSourcePlugin):
             'age_limit': None,  # Don't skip age-restricted
         }
 
-        # Cookie support — a logged-in browser store OR a pasted cookies.txt
-        # (the 'custom' paste mode resolves to a cookiefile, not a browser name).
-        self.download_opts.update(_resolve_cookie_opts())
+        # Cookie support — use browser cookies for YouTube auth
+        from config.settings import config_manager
+        cookies_browser = ('' if (_cb := config_manager.get('youtube.cookies_browser', '')) == 'custom' else _cb)
+        if cookies_browser:
+            self.download_opts['cookiesfrombrowser'] = (cookies_browser,)
 
         # Track current download progress (mirrors Soulseek transfer tracking)
         self.current_download_id: Optional[str] = None
@@ -436,13 +438,11 @@ class YouTubeClient(DownloadSourcePlugin):
         """Reload YouTube settings from config (called when settings are saved)."""
         from config.settings import config_manager
         self._download_delay = config_manager.get('youtube.download_delay', 3)
-        # Clear both cookie sources, then re-apply from current settings (browser
-        # store or pasted cookies.txt) so a mode switch doesn't leave a stale arg.
-        self.download_opts.pop('cookiesfrombrowser', None)
-        self.download_opts.pop('cookiefile', None)
-        cookie_state = _resolve_cookie_state()
-        _cookie_opts = cookie_state.get("opts", {})
-        self.download_opts.update(_cookie_opts)
+        cookies_browser = ('' if (_cb := config_manager.get('youtube.cookies_browser', '')) == 'custom' else _cb)
+        if cookies_browser:
+            self.download_opts['cookiesfrombrowser'] = (cookies_browser,)
+        elif 'cookiesfrombrowser' in self.download_opts:
+            del self.download_opts['cookiesfrombrowser']
 
         # Reload download path
         new_path = Path(config_manager.get('soulseek.download_path', './downloads'))
@@ -869,10 +869,9 @@ class YouTubeClient(DownloadSourcePlugin):
                     'default_search': 'ytsearch',
                     'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
                 }
-                cookie_opts = _resolve_cookie_opts()
-                ydl_opts.update(cookie_opts)
-                if 'cookiefile' in cookie_opts:
-                    ydl_opts['extractor_args'] = {'youtube': {'player_client': ['web', 'mweb']}}
+                cookies_browser = ('' if (_cb := config_manager.get('youtube.cookies_browser', '')) == 'custom' else _cb)
+                if cookies_browser:
+                    ydl_opts['cookiesfrombrowser'] = (cookies_browser,)
 
                 search_query = self._escape_ytsearch_query(query)
                 with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -949,10 +948,9 @@ class YouTubeClient(DownloadSourcePlugin):
                 }
 
                 # Add cookie support for search (avoids bot detection)
-                cookie_opts = _resolve_cookie_opts()
-                ydl_opts.update(cookie_opts)
-                if 'cookiefile' in cookie_opts:
-                    ydl_opts['extractor_args'] = {'youtube': {'player_client': ['web', 'mweb']}}
+                cookies_browser = ('' if (_cb := config_manager.get('youtube.cookies_browser', '')) == 'custom' else _cb)
+                if cookies_browser:
+                    ydl_opts['cookiesfrombrowser'] = (cookies_browser,)
 
                 search_query = self._escape_ytsearch_query(query)
                 with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -1310,7 +1308,9 @@ class YouTubeClient(DownloadSourcePlugin):
                 'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
             }
 
-            download_opts.update(_resolve_cookie_opts())
+            cookies_browser = ('' if (_cb := config_manager.get('youtube.cookies_browser', '')) == 'custom' else _cb)
+            if cookies_browser:
+                download_opts['cookiesfrombrowser'] = (cookies_browser,)
 
             with yt_dlp.YoutubeDL(download_opts) as ydl:
                 info = ydl.extract_info(video_url, download=True)

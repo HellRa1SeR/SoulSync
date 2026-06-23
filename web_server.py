@@ -15424,20 +15424,10 @@ def _youtube_cookie_opts():
     server/Docker users supply. Precedence + emptiness live in core.youtube_cookies."""
     from core.youtube_cookies import resolve_active_cookiefile_path, resolve_youtube_cookie_state
     try:
-        mode = config_manager.get('youtube.cookies_browser', '')
-        stored_path = config_manager.get('youtube.cookies_file', '')
-        path = resolve_active_cookiefile_path(
-            config_manager.config_path,
-            config_manager.database_path,
-            stored_path or '',
-        )
-        state = resolve_youtube_cookie_state(mode, path)
-        logger.debug(
-            "YouTube cookie opts (playlist parse): reason=%s opt_keys=%s",
-            state.get('reason'),
-            list(state.get('opts', {}).keys()),
-        )
-        return state.get('opts', {})
+        cb = config_manager.get('youtube.cookies_browser', '')
+        # 'custom' = the paste-cookies.txt sentinel (not a yt-dlp browser); skip it here.
+        if cb and cb != 'custom':
+            opts['cookiesfrombrowser'] = (cb,)
     except Exception:  # noqa: S110 - cookie config is best-effort; resolve still works without it
         return {}
 

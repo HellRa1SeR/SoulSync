@@ -55494,7 +55494,7 @@ tr.tag-diff-same {
     min-width: 0;
 }
 
-/* ── Settings local title — quiet, far-left, no dashboard banner ── */
+/* ── Compact settings header — single row, no wasted vertical space ── */
 #settings-page .dashboard-header.settings-header-compact {
     flex-direction: row;
     align-items: center;

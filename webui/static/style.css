@@ -68783,3 +68783,14 @@ body.app-locked > *:not(#launch-pin-overlay):not(#login-overlay):not(script):not
         -webkit-backdrop-filter: none !important;
     }
 }
+
+/* Settings cleanup: source settings uses the same inner-card spacing as Retry Logic. */
+#settings-page .settings-section-body:not(.collapsed) > .settings-group.source-settings-wrapper {
+    padding: 0 !important;
+    display: flex;
+    flex-direction: column;
+    gap: 14px;
+}
+#settings-page .settings-section-body:not(.collapsed) > .settings-group.source-settings-wrapper > .settings-subcard {
+    margin: 0 !important;
+}

@@ -38,18 +38,133 @@ from core.download_plugins.types import SearchResult, TrackResult, AlbumResult, 
 logger = get_logger("youtube_client")
 
 
+def _resolve_cookie_state() -> dict:
+    """Resolve YouTube cookie opts + diagnostic metadata from live config."""
+    from config.settings import config_manager
+    from core.youtube_cookies import resolve_active_cookiefile_path, resolve_youtube_cookie_state
+
+    mode = config_manager.get('youtube.cookies_browser', '')
+    stored_path = config_manager.get('youtube.cookies_file', '')
+    cookiefile = resolve_active_cookiefile_path(
+        config_manager.config_path,
+        config_manager.database_path,
+        stored_path or '',
+    )
+
+    state = resolve_youtube_cookie_state(mode, cookiefile)
+    audit = state.get("audit") or {}
+    log_fn = logger.info if state.get("opts") else logger.debug
+    log_fn(
+        "YouTube cookies: reason=%s path=%s rows=%s auth_ok=%s auth_names=%s opt_keys=%s",
+        state.get("reason"),
+        state.get("path"),
+        state.get("cookie_row_count"),
+        audit.get("auth_ok"),
+        len(audit.get("youtube_auth_names") or []),
+        list(state.get("opts", {}).keys()),
+    )
+    if state.get("opts") and not audit.get("auth_ok"):
+        logger.warning(
+            "YouTube cookies file at %s has no login session cookies (SID/LOGIN_INFO/__Secure-1PSID) — "
+            "re-export from youtube.com while signed in",
+            state.get("path"),
+        )
+    return state
+
+
 def _resolve_cookie_opts() -> dict:
     """yt-dlp cookie options from Settings → YouTube: either a browser store OR a
     pasted cookies.txt. The 'Paste cookies.txt' dropdown value is the sentinel
     'custom' — which must become a yt-dlp ``cookiefile`` pointing at the saved file,
     NOT be passed through as a browser name (yt-dlp rejects: 'unsupported browser:
     custom'). Delegates to the shared, tested precedence in core.youtube_cookies."""
-    from config.settings import config_manager
-    from core.youtube_cookies import build_youtube_cookie_opts
-    mode = config_manager.get('youtube.cookies_browser', '')
-    cookiefile = config_manager.get('youtube.cookies_file', '')
-    exists = bool(cookiefile) and os.path.exists(cookiefile)
-    return build_youtube_cookie_opts(mode, cookiefile, cookiefile_exists=exists)
+    return _resolve_cookie_state().get("opts", {})
+
+
+def _apply_download_retry_strategy(
+    download_opts: dict,
+    attempt: int,
+    max_retries: int,
+    *,
+    last_error: str = "",
+) -> dict:
+    """Adjust yt-dlp opts for retry attempts; keep cookies on bot-check failures."""
+    from core.youtube_cookies import is_bot_check_error
+
+    opts = download_opts.copy()
+    opts.pop('cookiesfrombrowser', None)
+    opts.pop('cookiefile', None)
+    opts.pop('extractor_args', None)
+    opts.update(_resolve_cookie_opts())
+
+    has_cookies = 'cookiesfrombrowser' in opts or 'cookiefile' in opts
+    bot_error = is_bot_check_error(last_error)
+
+    if attempt == 0:
+        if 'cookiefile' in opts:
+            # Cookie auth works best with web clients from the first attempt.
+            opts['extractor_args'] = {'youtube': {'player_client': ['web', 'mweb']}}
+        logger.info(
+            "YouTube download attempt 1/%s: cookies=%s cookiefile=%s",
+            max_retries,
+            has_cookies,
+            'cookiefile' in opts,
+        )
+        return opts
+
+    if attempt == 1:
+        if has_cookies and bot_error:
+            logger.info(
+                "Retry %s/%s with tv/web_creator clients (keeping cookies after bot check)",
+                attempt + 1,
+                max_retries,
+            )
+            opts['extractor_args'] = {'youtube': {'player_client': ['tv', 'web_creator', 'mweb']}}
+        elif has_cookies and not bot_error:
+            logger.info(
+                "Retry %s/%s without cookies (format restriction workaround)",
+                attempt + 1,
+                max_retries,
+            )
+            opts.pop('cookiesfrombrowser', None)
+            opts.pop('cookiefile', None)
+        else:
+            logger.info("Retry %s/%s with web_creator client", attempt + 1, max_retries)
+            opts['extractor_args'] = {'youtube': {'player_client': ['web_creator']}}
+        logger.debug(
+            "YouTube download attempt %s/%s strategy: cookies=%s extractor_args=%s",
+            attempt + 1,
+            max_retries,
+            'cookiefile' in opts or 'cookiesfrombrowser' in opts,
+            bool(opts.get('extractor_args')),
+        )
+        return opts
+
+    # attempt >= 2
+    if has_cookies and bot_error:
+        logger.info(
+            "Retry %s/%s with ios/web clients + best format (keeping cookies after bot check)",
+            attempt + 1,
+            max_retries,
+        )
+        opts['format'] = 'best'
+        opts['extractor_args'] = {'youtube': {'player_client': ['ios', 'web', 'mweb']}}
+    elif has_cookies and not bot_error:
+        logger.info("Retry %s/%s with 'best' format without cookies", attempt + 1, max_retries)
+        opts['format'] = 'best'
+        opts.pop('cookiesfrombrowser', None)
+        opts.pop('cookiefile', None)
+    else:
+        logger.info("Retry %s/%s with 'best' format (video fallback)", attempt + 1, max_retries)
+        opts['format'] = 'best'
+    logger.debug(
+        "YouTube download attempt %s/%s strategy: cookies=%s format=%s",
+        attempt + 1,
+        max_retries,
+        'cookiefile' in opts or 'cookiesfrombrowser' in opts,
+        opts.get('format'),
+    )
+    return opts
 
 
 @dataclass
@@ -325,7 +440,8 @@ class YouTubeClient(DownloadSourcePlugin):
         # store or pasted cookies.txt) so a mode switch doesn't leave a stale arg.
         self.download_opts.pop('cookiesfrombrowser', None)
         self.download_opts.pop('cookiefile', None)
-        _cookie_opts = _resolve_cookie_opts()
+        cookie_state = _resolve_cookie_state()
+        _cookie_opts = cookie_state.get("opts", {})
         self.download_opts.update(_cookie_opts)
 
         # Reload download path
@@ -336,7 +452,12 @@ class YouTubeClient(DownloadSourcePlugin):
             self.download_opts['outtmpl'] = str(self.download_path / '%(title)s.%(ext)s')
             logger.info(f"YouTube download path updated to: {self.download_path}")
 
-        logger.info(f"YouTube settings reloaded (delay={self._download_delay}s, cookies={'enabled' if _cookie_opts else 'disabled'})")
+        logger.info(
+            "YouTube settings reloaded (delay=%ss, cookies=%s, reason=%s)",
+            self._download_delay,
+            'enabled' if _cookie_opts else 'disabled',
+            cookie_state.get('reason', 'unknown'),
+        )
 
     async def check_connection(self) -> bool:
         """
@@ -748,7 +869,10 @@ class YouTubeClient(DownloadSourcePlugin):
                     'default_search': 'ytsearch',
                     'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
                 }
-                ydl_opts.update(_resolve_cookie_opts())
+                cookie_opts = _resolve_cookie_opts()
+                ydl_opts.update(cookie_opts)
+                if 'cookiefile' in cookie_opts:
+                    ydl_opts['extractor_args'] = {'youtube': {'player_client': ['web', 'mweb']}}
 
                 search_query = self._escape_ytsearch_query(query)
                 with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -825,7 +949,10 @@ class YouTubeClient(DownloadSourcePlugin):
                 }
 
                 # Add cookie support for search (avoids bot detection)
-                ydl_opts.update(_resolve_cookie_opts())
+                cookie_opts = _resolve_cookie_opts()
+                ydl_opts.update(cookie_opts)
+                if 'cookiefile' in cookie_opts:
+                    ydl_opts['extractor_args'] = {'youtube': {'player_client': ['web', 'mweb']}}
 
                 search_query = self._escape_ytsearch_query(query)
                 with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -1078,6 +1205,7 @@ class YouTubeClient(DownloadSourcePlugin):
         """
         try:
             max_retries = 3
+            last_error = ""
             for attempt in range(max_retries):
                 # Check for server shutdown using callback
                 if self.shutdown_check and self.shutdown_check():
@@ -1085,33 +1213,15 @@ class YouTubeClient(DownloadSourcePlugin):
                     return None
 
                 try:
-                    # Use default download options
                     download_opts = self.download_opts.copy()
-                    
-                    # Force best audio format to prevent 'Requested format not available' errors
                     download_opts['format'] = 'bestaudio/best'
                     download_opts['noplaylist'] = True
-
-                    # On retry, try different strategies
-                    if attempt == 1:
-                        # Drop cookies — authenticated sessions (browser store OR a
-                        # pasted cookies.txt) sometimes get restricted formats.
-                        if 'cookiesfrombrowser' in download_opts or 'cookiefile' in download_opts:
-                            logger.info(f"Retry {attempt + 1}/{max_retries} without cookies")
-                            download_opts.pop('cookiesfrombrowser', None)
-                            download_opts.pop('cookiefile', None)
-                        else:
-                            logger.info(f"Retry {attempt + 1}/{max_retries} with web_creator client")
-                            download_opts['extractor_args'] = {
-                                'youtube': { 'player_client': ['web_creator'] }
-                            }
-                    elif attempt >= 2:
-                        logger.info(f"Retry {attempt + 1}/{max_retries} with 'best' format (video fallback)")
-                        download_opts['format'] = 'best'
-                        download_opts.pop('cookiesfrombrowser', None)
-                        download_opts.pop('cookiefile', None)
-                        download_opts.pop('extractor_args', None)
-
+                    download_opts = _apply_download_retry_strategy(
+                        download_opts,
+                        attempt,
+                        max_retries,
+                        last_error=last_error,
+                    )
 
                     # Perform download
                     with yt_dlp.YoutubeDL(download_opts) as ydl:
@@ -1129,8 +1239,20 @@ class YouTubeClient(DownloadSourcePlugin):
                             return None
 
                 except Exception as e:
+                    from core.youtube_cookies import is_bot_check_error
                     error_msg = str(e)
+                    last_error = error_msg
                     logger.error(f"Download attempt {attempt + 1} failed: {error_msg}")
+                    if is_bot_check_error(error_msg):
+                        audit = _resolve_cookie_state().get("audit") or {}
+                        logger.warning(
+                            "YouTube bot check on attempt %s — cookie path=%s rows=%s auth_ok=%s "
+                            "(re-export cookies from youtube.com while logged in if auth_ok=False)",
+                            attempt + 1,
+                            audit.get("path"),
+                            audit.get("row_count"),
+                            audit.get("auth_ok"),
+                        )
 
                     # Check if it's a 403 error
                     if '403' in error_msg or 'Forbidden' in error_msg:

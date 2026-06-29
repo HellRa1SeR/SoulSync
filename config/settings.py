@@ -735,7 +735,8 @@ class ConfigManager:
                 "materialize_mode": "symlink"
             },
             "youtube": {
-                "cookies_browser": "",      # "", "chrome", "firefox", "edge", "brave", "opera", "safari"
+                "cookies_browser": "",      # "", "chrome", "firefox", "edge", "brave", "opera", "safari", "custom"
+                "cookies_file": "",         # path to pasted cookies.txt (server/Docker)
                 "download_delay": 3,        # seconds between sequential downloads
             },
             "hydrabase": {

@@ -232,6 +232,22 @@ function initializeSettings() {
         settingsPage.querySelectorAll('input[type="checkbox"], select').forEach(input => {
             input.addEventListener('change', debouncedAutoSaveSettings);
         });
+        const ytPaste = document.getElementById('youtube-cookies-paste');
+        if (ytPaste && !ytPaste.dataset.autosaveBound) {
+            ytPaste.addEventListener('input', debouncedAutoSaveSettings);
+            ytPaste.dataset.autosaveBound = '1';
+        }
+        const ytCookieSel = document.getElementById('youtube-cookies-browser');
+        if (ytCookieSel && !ytCookieSel.dataset.clearCookiesBound) {
+            ytCookieSel.addEventListener('change', () => {
+                if (ytCookieSel.value === '') {
+                    ytCookieSel.dataset.clearCookies = '1';
+                } else {
+                    delete ytCookieSel.dataset.clearCookies;
+                }
+            });
+            ytCookieSel.dataset.clearCookiesBound = '1';
+        }
     }
 
     const metadataSourceSelect = document.getElementById('metadata-fallback-source');
@@ -1138,6 +1154,54 @@ function updatePlexConfigurationButtons() {
     if (plexPinAuthFlow) plexPinAuthFlow.style.display = 'none';
 }
 
+function _updateYoutubeCookieUI(youtubeSettings) {
+    const sel = document.getElementById('youtube-cookies-browser');
+    const pasteBox = document.getElementById('youtube-cookies-paste');
+    const pasteGroup = document.getElementById('youtube-cookies-paste-group');
+    const statusEl = document.getElementById('youtube-cookies-status');
+    const yt = youtubeSettings || {};
+
+    if (sel && yt.cookies_browser) {
+        sel.value = yt.cookies_browser;
+    }
+    if (pasteGroup && sel) {
+        pasteGroup.style.display = sel.value === 'custom' ? '' : 'none';
+    }
+
+    const configured = yt.cookies_configured === true
+        || (yt.cookies_file && yt.cookies_file_present !== false);
+    const filePresent = yt.cookies_file_present !== false && (configured || !!yt.cookies_file);
+
+    if (pasteBox) {
+        if (filePresent || configured) {
+            pasteBox.placeholder = 'A cookies.txt is saved on the server. Paste again to replace it, or leave blank to keep it.';
+        }
+    }
+    if (statusEl) {
+        if (filePresent || configured) {
+            statusEl.style.display = '';
+            statusEl.classList.remove('youtube-cookies-status--warn');
+            statusEl.classList.add('youtube-cookies-status--ok');
+            if (yt.cookies_auth_ok === false) {
+                statusEl.classList.remove('youtube-cookies-status--ok');
+                statusEl.classList.add('youtube-cookies-status--warn');
+                statusEl.textContent = '⚠ Cookies saved, but no YouTube login session detected — open youtube.com, sign in, re-export cookies, and paste again.';
+            } else {
+                statusEl.textContent = '✓ Cookies saved on server. Content is not shown here for security — re-paste to replace.';
+            }
+        } else if (yt.cookies_file && yt.cookies_file_present === false) {
+            statusEl.style.display = '';
+            statusEl.classList.remove('youtube-cookies-status--ok');
+            statusEl.classList.add('youtube-cookies-status--warn');
+            statusEl.textContent = '⚠ A cookie path is configured but the file is missing on the server — paste cookies again.';
+        } else {
+            statusEl.style.display = 'none';
+            statusEl.textContent = '';
+            statusEl.classList.remove('youtube-cookies-status--ok', 'youtube-cookies-status--warn');
+        }
+    }
+}
+
 async function loadSettingsData() {
     try {
         const response = await fetch(API.settings);
@@ -1393,15 +1457,14 @@ async function loadSettingsData() {
             const _toggleYtPaste = () => {
                 _ytPasteGroup.style.display = _ytCookieSel.value === 'custom' ? '' : 'none';
             };
-            if (_ytPasteBox && settings.youtube?.cookies_file) {
-                _ytPasteBox.placeholder = 'A cookies.txt is saved. Paste again to replace it, or leave blank to keep it.';
-            }
+            _updateYoutubeCookieUI(settings.youtube || {});
             _toggleYtPaste();
             if (!_ytCookieSel.dataset.pasteToggleBound) {
                 _ytCookieSel.addEventListener('change', _toggleYtPaste);
                 _ytCookieSel.dataset.pasteToggleBound = '1';
             }
         }
+        window._youtubeSettingsHydrated = true;
 
         // Update UI based on download source mode
         updateDownloadSourceUI();
@@ -3497,13 +3560,6 @@ async function saveSettings(quiet = false) {
             worker_orbs_enabled: document.getElementById('worker-orbs-enabled')?.checked !== false,
             reduce_effects: document.getElementById('reduce-effects-enabled')?.checked === true
         },
-        youtube: {
-            cookies_browser: document.getElementById('youtube-cookies-browser').value,
-            download_delay: parseInt(document.getElementById('youtube-download-delay').value) || 3,
-            // Raw cookies.txt blob — backend validates, writes it to a file, and stores
-            // only the path (never echoed back). Blank = keep any already-saved file.
-            cookies_paste: document.getElementById('youtube-cookies-paste')?.value || '',
-        },
         security: {
             require_pin_on_launch: document.getElementById('security-require-pin')?.checked || false,
             cors_origins: document.getElementById('security-cors-origins')?.value?.trim() || '',
@@ -3512,6 +3568,22 @@ async function saveSettings(quiet = false) {
             require_login: document.getElementById('security-require-login')?.checked || false,
         }
     };
+
+    // Only send YouTube settings after the form has been hydrated from the server.
+    // Otherwise stale DOM defaults (cookies_browser="") would wipe a saved Docker config.
+    if (window._youtubeSettingsHydrated) {
+        const ytSel = document.getElementById('youtube-cookies-browser');
+        const ytPaste = document.getElementById('youtube-cookies-paste');
+        settings.youtube = {
+            cookies_browser: ytSel ? ytSel.value : '',
+            download_delay: parseInt(document.getElementById('youtube-download-delay')?.value) || 3,
+            cookies_paste: ytPaste?.value || '',
+        };
+        if (ytSel && ytSel.dataset.clearCookies === '1') {
+            settings.youtube.clear_cookies = true;
+            delete ytSel.dataset.clearCookies;
+        }
+    }
 
     // Validate cors_origins entries — backend silently filters malformed
     // values, so warn the user up-front if any line doesn't look like a
@@ -3580,14 +3652,35 @@ async function saveSettings(quiet = false) {
 
         if (result.success && qualityProfileSaved && lookbackSaved) {
             showToast(quiet ? 'Settings auto-saved' : 'Settings saved successfully', 'success');
+            if (result.youtube) {
+                _updateYoutubeCookieUI(result.youtube);
+                const ytPaste = document.getElementById('youtube-cookies-paste');
+                if (ytPaste && ytPaste.value.trim()) {
+                    ytPaste.value = '';
+                }
+            }
             _forceServiceStatusRefresh();
             _stgRefreshAfterSave();
         } else if (result.success && qualityProfileSaved && !lookbackSaved) {
             showToast('Settings saved, but discovery lookback period failed to save', 'warning');
+            if (result.youtube) {
+                _updateYoutubeCookieUI(result.youtube);
+                const ytPaste = document.getElementById('youtube-cookies-paste');
+                if (ytPaste && ytPaste.value.trim()) {
+                    ytPaste.value = '';
+                }
+            }
             _forceServiceStatusRefresh();
             _stgRefreshAfterSave();
         } else if (result.success && !qualityProfileSaved) {
             showToast('Settings saved, but quality profile failed to save', 'warning');
+            if (result.youtube) {
+                _updateYoutubeCookieUI(result.youtube);
+                const ytPaste = document.getElementById('youtube-cookies-paste');
+                if (ytPaste && ytPaste.value.trim()) {
+                    ytPaste.value = '';
+                }
+            }
             _forceServiceStatusRefresh();
             _stgRefreshAfterSave();
         } else {

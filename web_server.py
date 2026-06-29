@@ -3292,16 +3292,47 @@ def handle_settings():
             # secret + bulky. We validate up front and store only a file path.
             _yt_in = new_settings.get('youtube')
             _yt_paste = _yt_in.pop('cookies_paste', None) if isinstance(_yt_in, dict) else None
+            _yt_clear = _yt_in.pop('clear_cookies', None) if isinstance(_yt_in, dict) else None
             if _yt_paste is not None and str(_yt_paste).strip():
-                from core.youtube_cookies import looks_like_cookiefile, write_pasted_cookiefile
+                from core.youtube_cookies import (
+                    PASTE_MODE,
+                    cookiefile_has_youtube_auth,
+                    get_cookiefile_path,
+                    looks_like_cookiefile,
+                    migrate_cookiefile_to_canonical,
+                    write_pasted_cookiefile,
+                )
+                paste_len = len(str(_yt_paste))
+                logger.debug("YouTube cookies paste received (%s bytes)", paste_len)
                 if not looks_like_cookiefile(_yt_paste):
+                    logger.debug("YouTube cookies paste rejected: validation failed")
                     return jsonify({"success": False,
                                     "error": "That doesn't look like a cookies.txt file. Export it "
                                              "with a 'Get cookies.txt LOCALLY' browser extension and "
                                              "paste the whole file."}), 400
-                _cookie_path = str(config_manager.config_path.parent / "youtube_cookies.txt")
+                if not cookiefile_has_youtube_auth(_yt_paste):
+                    return jsonify({"success": False,
+                                    "error": "No YouTube login cookies found. Open youtube.com in your "
+                                             "browser, sign in, then export cookies for youtube.com "
+                                             "(need SID, LOGIN_INFO, or __Secure-1PSID)."}), 400
+                migrate_cookiefile_to_canonical(
+                    config_manager.config_path,
+                    config_manager.database_path,
+                )
+                _cookie_path = str(get_cookiefile_path(
+                    config_manager.config_path,
+                    config_manager.database_path,
+                ))
                 if write_pasted_cookiefile(_yt_paste, _cookie_path):
                     config_manager.set('youtube.cookies_file', _cookie_path)
+                    config_manager.set('youtube.cookies_browser', PASTE_MODE)
+                    logger.debug(
+                        "YouTube cookies saved to %s; mode set to %s",
+                        _cookie_path,
+                        PASTE_MODE,
+                    )
+                    if isinstance(_yt_in, dict):
+                        _yt_in['cookies_browser'] = PASTE_MODE
 
             if 'active_media_server' in new_settings:
                 config_manager.set_active_media_server(new_settings['active_media_server'])
@@ -3309,6 +3340,20 @@ def handle_settings():
             for service in ['spotify', 'plex', 'jellyfin', 'navidrome', 'soulseek', 'download_source', 'settings', 'database', 'metadata_enhancement', 'file_organization', 'playlist_sync', 'tidal', 'tidal_download', 'qobuz', 'hifi_download', 'deezer_download', 'amazon_download', 'lidarr_download', 'prowlarr', 'torrent_client', 'usenet_client', 'listenbrainz', 'acoustid', 'lastfm', 'genius', 'import', 'lossy_copy', 'listening_stats', 'ui_appearance', 'youtube', 'content_filter', 'itunes', 'm3u_export', 'musicbrainz', 'deezer', 'audiodb', 'metadata', 'hydrabase', 'security', 'discogs', 'library', 'discover', 'wishlist', 'genre_whitelist', 'post_processing', 'playlists']:
                 if service in new_settings:
                     for key, value in new_settings[service].items():
+                        if service == 'youtube' and key == 'cookies_browser':
+                            from core.youtube_cookies import cookiefile_has_valid_rows
+                            stored_path = config_manager.get('youtube.cookies_file', '')
+                            if (
+                                value in (None, '')
+                                and not _yt_clear
+                                and stored_path
+                                and cookiefile_has_valid_rows(stored_path)
+                            ):
+                                logger.debug(
+                                    "Ignoring empty cookies_browser save — valid cookie file exists at %s",
+                                    stored_path,
+                                )
+                                continue
                         config_manager.set(f'{service}.{key}', value)
 
             logger.info("Settings saved successfully via Web UI.")
@@ -3359,7 +3404,15 @@ def handle_settings():
             # Invalidate status cache so next poll reflects new settings (e.g. fallback source change)
             invalidate_metadata_status_caches()
             logger.info("Service clients re-initialized with new settings.")
-            return jsonify({"success": True, "message": "Settings saved successfully."})
+            from core.youtube_cookies import resolve_youtube_cookie_state, youtube_cookie_summary
+            _yt_mode = config_manager.get('youtube.cookies_browser', '')
+            _yt_path = config_manager.get('youtube.cookies_file', '')
+            _yt_state = resolve_youtube_cookie_state(_yt_mode, _yt_path or '')
+            return jsonify({
+                "success": True,
+                "message": "Settings saved successfully.",
+                "youtube": youtube_cookie_summary(_yt_state),
+            })
         except Exception as e:
             return jsonify({"success": False, "error": str(e)}), 500
     else:  # GET request
@@ -15322,12 +15375,22 @@ def _youtube_cookie_opts():
     dropdown is either a browser name (cookiesfrombrowser, local installs) or the
     PASTE_MODE sentinel, in which case we point yt-dlp at the pasted cookies.txt that
     server/Docker users supply. Precedence + emptiness live in core.youtube_cookies."""
-    from core.youtube_cookies import build_youtube_cookie_opts
+    from core.youtube_cookies import resolve_active_cookiefile_path, resolve_youtube_cookie_state
     try:
         mode = config_manager.get('youtube.cookies_browser', '')
-        path = config_manager.get('youtube.cookies_file', '')
-        exists = bool(path) and os.path.exists(path)
-        return build_youtube_cookie_opts(mode, path, cookiefile_exists=exists)
+        stored_path = config_manager.get('youtube.cookies_file', '')
+        path = resolve_active_cookiefile_path(
+            config_manager.config_path,
+            config_manager.database_path,
+            stored_path or '',
+        )
+        state = resolve_youtube_cookie_state(mode, path)
+        logger.debug(
+            "YouTube cookie opts (playlist parse): reason=%s opt_keys=%s",
+            state.get('reason'),
+            list(state.get('opts', {}).keys()),
+        )
+        return state.get('opts', {})
     except Exception:  # noqa: S110 - cookie config is best-effort; resolve still works without it
         return {}
 

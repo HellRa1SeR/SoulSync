@@ -56176,6 +56176,14 @@ tr.tag-diff-same {
     padding: 0;
 }
 
+#settings-page .youtube-cookies-status--ok {
+    color: rgb(var(--accent-light-rgb, 29, 185, 84));
+}
+
+#settings-page .youtube-cookies-status--warn {
+    color: #e6a817;
+}
+
 /* ── Download source containers ── */
 #settings-page #soulseek-settings-container,
 #settings-page #tidal-download-settings-container,

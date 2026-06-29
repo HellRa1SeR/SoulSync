@@ -334,8 +334,15 @@ class LibraryRetagJob(RepairJob):
 
             source = next((s for s in source_order if source_ids.get(s)), None)
             if not source:
-                continue  # not matched to a usable source — skip
-            album_source_id = str(source_ids[source])
+                # No stored source id — try to resolve from embedded tags /
+                # filenames on the album's track files.
+                source, album_source_id = self._resolve_source_from_files(
+                    context, album_id, album_title, artist_name,
+                )
+                if not source:
+                    continue
+            else:
+                album_source_id = str(source_ids[source])
 
             try:
                 self._scan_album(context, result, album_id, album_title, artist_name,
@@ -350,6 +357,49 @@ class LibraryRetagJob(RepairJob):
         logger.info("Library re-tag scan: %d albums checked, %d findings",
                     result.scanned, result.findings_created)
         return result
+
+    def _resolve_source_from_files(self, context, album_id, album_title, artist_name):
+        """Try to find a metadata-source album id from on-disk file hints."""
+        with context.db._get_connection() as conn:
+            cur = conn.cursor()
+            cur.execute("""
+                SELECT file_path FROM tracks
+                WHERE album_id = ? AND file_path IS NOT NULL AND file_path != ''
+                ORDER BY disc_number, track_number
+                LIMIT 10
+            """, (album_id,))
+            raw_paths = [r[0] for r in cur.fetchall()]
+        if not raw_paths:
+            return None, None
+
+        download_folder = (context.config_manager.get('soulseek.download_path', '')
+                           if context.config_manager else None)
+        resolved_paths = []
+        for raw in raw_paths:
+            rp = resolve_library_file_path(
+                raw,
+                transfer_folder=getattr(context, 'transfer_folder', None),
+                download_folder=download_folder,
+                config_manager=context.config_manager,
+            )
+            if rp and os.path.isfile(rp):
+                resolved_paths.append(rp)
+
+        from core.metadata.file_search_hints import (
+            collect_album_hints_from_files,
+            resolve_album_source_from_hints,
+        )
+        hints = collect_album_hints_from_files(
+            resolved_paths,
+            db_album=album_title or '',
+            db_artist=artist_name or '',
+        )
+        if not hints.album and not hints.search_queries:
+            return None, None
+
+        return resolve_album_source_from_hints(hints, self._source_order(
+            self._get_settings(context),
+        )) or (None, None)
 
     def _scan_album(self, context, result, album_id, album_title, artist_name,
                     source, album_source_id, mode, cover_mode, dry_run=True, depth='light',
@@ -370,6 +420,19 @@ class LibraryRetagJob(RepairJob):
             ]
         if not library_tracks:
             return
+
+        download_folder = (context.config_manager.get('soulseek.download_path', '')
+                           if context.config_manager else None)
+        from core.metadata.file_search_hints import enrich_track_titles_from_files
+        library_tracks_for_match = enrich_track_titles_from_files(
+            library_tracks,
+            resolve_path_fn=lambda p: resolve_library_file_path(
+                p,
+                transfer_folder=getattr(context, 'transfer_folder', None),
+                download_folder=download_folder,
+                config_manager=context.config_manager,
+            ),
+        )
 
         album_meta = get_album_for_source(source, album_source_id)
         source_tracks = _track_list(get_album_tracks_for_source(source, album_source_id))
@@ -406,9 +469,7 @@ class LibraryRetagJob(RepairJob):
         # tracks for the apply to embed art into.
         cover_action = self._cover_action(cover_mode, cover_url, library_tracks)
 
-        pairs = match_source_tracks(source_tracks, library_tracks)
-        download_folder = (context.config_manager.get('soulseek.download_path', '')
-                           if context.config_manager else None)
+        pairs = match_source_tracks(source_tracks, library_tracks_for_match)
         track_plans = []
         unmatched = []
         unreachable = 0

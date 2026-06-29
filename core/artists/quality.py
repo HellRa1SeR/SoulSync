@@ -409,18 +409,39 @@ def enhance_artist_quality(artist_id, track_ids, deps: ArtistQualityDeps):
                 )
 
             # 2. Multi-source parallel text search fallback — for tracks
-            # with no stored IDs / lookup misses.
+            # with no stored IDs / lookup misses. Search prompts prefer
+            # embedded file tags + filename over thin/wrong library metadata.
             if not matched_track_data and search_sources:
                 try:
+                    resolved_path = None
+                    if file_path:
+                        try:
+                            from core.library.path_resolver import resolve_library_file_path
+                            resolved_path = resolve_library_file_path(file_path)
+                        except Exception:
+                            resolved_path = file_path if os.path.isfile(file_path) else None
+
+                    from core.metadata.file_search_hints import collect_file_search_hints
+                    hints = collect_file_search_hints(
+                        resolved_path,
+                        db_title=title,
+                        db_artist=artist_name,
+                        db_album=album_title,
+                        db_duration_ms=track.get('duration', 0) or 0,
+                    )
                     track_query = TrackQuery(
-                        title=title,
-                        artist=artist_name,
-                        album=album_title,
-                        duration_ms=track.get('duration', 0) or 0,
+                        title=hints.title or title,
+                        artist=hints.artist or artist_name,
+                        album=hints.album or album_title,
+                        duration_ms=hints.duration_ms or (track.get('duration', 0) or 0),
                         spotify_track_id=track.get('spotify_track_id'),
                         deezer_id=track.get('deezer_id'),
                     )
-                    multi_result = search_all_sources(track_query, search_sources)
+                    multi_result = search_all_sources(
+                        track_query,
+                        search_sources,
+                        extra_queries=hints.search_queries,
+                    )
                     if multi_result.best_match and multi_result.best_match['score'] >= _AUTO_ACCEPT_SCORE_THRESHOLD:
                         chosen_source = multi_result.best_match['source']
                         best_track_obj = multi_result.best_track()

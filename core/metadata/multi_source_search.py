@@ -69,6 +69,8 @@ class MultiSourceResult:
     # Best match across all sources, or None if every source returned
     # nothing. Shape: ``{'source': str, 'index': int, 'score': float}``.
     best_match: Optional[dict] = None
+    # When file-tag / filename hints were used, echoed for the UI.
+    file_hints: Optional[dict] = None
 
     def best_track(self) -> Optional[Any]:
         """Convenience: return the source-native Track object for the
@@ -118,10 +120,12 @@ def _build_source_query(source_name: str, query: TrackQuery, clean_title: str) -
 
 
 def _search_one_source(source_name: str, client: Any,
-                       query: TrackQuery, clean_title: str
+                       query: TrackQuery, clean_title: str,
+                       extra_queries: Optional[List[str]] = None,
                        ) -> Tuple[str, List[dict], List[Any]]:
-    """Run one source's search with three-tier query fallback.
+    """Run one source's search with tiered query fallback.
 
+    Tier 0: optional ``extra_queries`` (from file tags / filename hints).
     Tier 1: source-optimized query (Deezer's structured form, others' plain).
     Tier 2: plain ``artist + title`` if tier 1 returned nothing.
     Tier 3: title-only as last resort.
@@ -138,12 +142,22 @@ def _search_one_source(source_name: str, client: Any,
         plain_q = f"{query.artist} {clean_title}"
         title_q = clean_title
 
-        logger.info(f"[MultiSourceSearch] Searching {source_name} for: {primary_q}")
-        track_objs = client.search_tracks(primary_q, limit=10)
-        if not track_objs and primary_q != plain_q:
-            track_objs = client.search_tracks(plain_q, limit=10)
-        if not track_objs and clean_title != plain_q:
-            track_objs = client.search_tracks(title_q, limit=10)
+        query_chain: List[str] = []
+        for q in (extra_queries or []):
+            q = (q or "").strip()
+            if q and q.lower() not in {x.lower() for x in query_chain}:
+                query_chain.append(q)
+        for q in (primary_q, plain_q, title_q):
+            q = (q or "").strip()
+            if q and q.lower() not in {x.lower() for x in query_chain}:
+                query_chain.append(q)
+
+        track_objs: List[Any] = []
+        for search_q in query_chain:
+            logger.info(f"[MultiSourceSearch] Searching {source_name} for: {search_q}")
+            track_objs = client.search_tracks(search_q, limit=10) or []
+            if track_objs:
+                break
         logger.info(f"[MultiSourceSearch] {source_name} returned {len(track_objs)} results")
 
         scored: List[Tuple[dict, Any]] = []
@@ -183,7 +197,9 @@ def _search_one_source(source_name: str, client: Any,
 def search_all_sources(query: TrackQuery,
                        sources: List[Tuple[str, Any]],
                        clean_title: Optional[str] = None,
-                       max_workers: int = 3) -> MultiSourceResult:
+                       max_workers: int = 3,
+                       extra_queries: Optional[List[str]] = None,
+                       file_hints: Optional[dict] = None) -> MultiSourceResult:
     """Run a parallel metadata search across every source in ``sources``.
 
     Args:
@@ -201,6 +217,11 @@ def search_all_sources(query: TrackQuery,
             the redownload endpoint's pre-extraction default — bumping
             higher rate-limits on slower sources without speeding up
             the slowest source's response.
+        extra_queries: Optional ranked query strings tried before the
+            built-in per-source fallbacks — typically from file tags /
+            filename parsing via ``file_search_hints``.
+        file_hints: Optional JSON-serializable dict (field_sources,
+            search_queries) echoed back to API callers for UI display.
 
     Returns:
         MultiSourceResult with per-source results + cross-source best match.
@@ -215,7 +236,9 @@ def search_all_sources(query: TrackQuery,
     raw_tracks: Dict[str, List[Any]] = {}
     with ThreadPoolExecutor(max_workers=max_workers) as pool:
         futures = {
-            pool.submit(_search_one_source, name, client, query, clean_title): name
+            pool.submit(
+                _search_one_source, name, client, query, clean_title, extra_queries,
+            ): name
             for name, client in sources
         }
         for future in as_completed(futures):
@@ -238,4 +261,5 @@ def search_all_sources(query: TrackQuery,
         metadata_results=metadata_results,
         raw_tracks=raw_tracks,
         best_match=best_match,
+        file_hints=file_hints,
     )

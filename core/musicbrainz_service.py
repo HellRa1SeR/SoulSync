@@ -1,4 +1,4 @@
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 import json
 import re
 from datetime import datetime, timedelta
@@ -431,6 +431,72 @@ class MusicBrainzService:
         except Exception as e:
             logger.error(f"Error matching recording '{track_name}': {e}")
             return None
+
+    def match_recording_with_file_hints(
+        self,
+        track_name: str,
+        artist_name: Optional[str] = None,
+        *,
+        file_path: Optional[str] = None,
+        album_name: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Match a recording using file tags/filename hints before library names."""
+        from core.metadata.file_search_hints import collect_file_search_hints
+
+        hints = collect_file_search_hints(
+            file_path,
+            db_title=track_name,
+            db_artist=artist_name or "",
+            db_album=album_name or "",
+        )
+        attempts: List[tuple[str, Optional[str]]] = []
+        if hints.title:
+            attempts.append((hints.title, hints.artist or None))
+        if track_name and (track_name != hints.title or (artist_name or "") != hints.artist):
+            attempts.append((track_name, artist_name))
+
+        seen: set[tuple[str, str]] = set()
+        for title, artist in attempts:
+            key = (title.lower().strip(), (artist or "").lower().strip())
+            if not title or key in seen:
+                continue
+            seen.add(key)
+            result = self.match_recording(title, artist)
+            if result:
+                return result
+        return None
+
+    def match_release_with_file_hints(
+        self,
+        album_name: str,
+        artist_name: Optional[str] = None,
+        *,
+        file_paths: Optional[List[str]] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Match a release using aggregated file-tag / filename hints."""
+        from core.metadata.file_search_hints import collect_album_hints_from_files
+
+        hints = collect_album_hints_from_files(
+            file_paths or [],
+            db_album=album_name,
+            db_artist=artist_name or "",
+        )
+        attempts: List[tuple[str, Optional[str]]] = []
+        if hints.album:
+            attempts.append((hints.album, hints.artist or None))
+        if album_name and (album_name != hints.album or (artist_name or "") != hints.artist):
+            attempts.append((album_name, artist_name))
+
+        seen: set[tuple[str, str]] = set()
+        for title, artist in attempts:
+            key = (title.lower().strip(), (artist or "").lower().strip())
+            if not title or key in seen:
+                continue
+            seen.add(key)
+            result = self.match_release(title, artist)
+            if result:
+                return result
+        return None
     
     def lookup_artist_aliases(self, artist_name: str) -> list:
         """Find alternate-spelling aliases for an artist by NAME.

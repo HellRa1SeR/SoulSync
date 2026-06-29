@@ -13025,10 +13025,34 @@ def redownload_search_metadata(track_id):
         # Clean the title for better search results — strip version/edition suffixes
         import re as _re
         clean_title = _re.sub(r'\s*[\(\[](single version|album version|remaster|deluxe|bonus|explicit|clean|radio edit)[\)\]]', '', track_title, flags=_re.IGNORECASE).strip()
-        query = f"{artist_name} {clean_title}"
 
         # Resolve file info
         file_path = row['file_path'] or ''
+        resolved_path = _resolve_library_file_path(file_path) if file_path else None
+
+        # Build search prompts from embedded tags + filename, falling back
+        # to library DB metadata when the file carries nothing useful.
+        from core.metadata.file_search_hints import collect_file_search_hints
+        hints = collect_file_search_hints(
+            resolved_path,
+            db_title=track_title,
+            db_artist=artist_name,
+            db_album=row['album_title'] or '',
+            db_duration_ms=row['duration'] or 0,
+        )
+        if hints.title:
+            clean_title = _re.sub(
+                r'\s*[\(\[](single version|album version|remaster|deluxe|bonus|explicit|clean|radio edit)[\)\]]',
+                '', hints.title, flags=_re.IGNORECASE,
+            ).strip() or clean_title
+        file_hints_payload = {
+            'title': hints.title,
+            'artist': hints.artist,
+            'album': hints.album,
+            'duration_ms': hints.duration_ms,
+            'field_sources': hints.field_sources,
+            'search_queries': hints.search_queries,
+        }
         ext = os.path.splitext(file_path)[1].lstrip('.').upper() if file_path else ''
         fmt = ext if ext in ('FLAC', 'MP3', 'OPUS', 'OGG', 'M4A', 'WAV') else ''
 
@@ -13083,15 +13107,19 @@ def redownload_search_metadata(track_id):
             logger.debug(f"Deezer client not available for redownload search: {e}")
 
         track_query = TrackQuery(
-            title=track_title,
-            artist=artist_name,
-            album=row['album_title'] or '',
-            duration_ms=row['duration'] or 0,
+            title=hints.title or track_title,
+            artist=hints.artist or artist_name,
+            album=hints.album or (row['album_title'] or ''),
+            duration_ms=hints.duration_ms or (row['duration'] or 0),
             spotify_track_id=row['spotify_track_id'],
             deezer_id=row['deezer_id'],
         )
         result = search_all_sources(
-            track_query, sources_to_search, clean_title=clean_title,
+            track_query,
+            sources_to_search,
+            clean_title=clean_title,
+            extra_queries=hints.search_queries,
+            file_hints=file_hints_payload,
         )
 
         return jsonify({
@@ -13099,6 +13127,7 @@ def redownload_search_metadata(track_id):
             "current_track": current_track,
             "metadata_results": result.metadata_results,
             "best_match": result.best_match,
+            "file_hints": result.file_hints,
         })
     except Exception as e:
         logger.error(f"Error in redownload metadata search: {e}", exc_info=True)

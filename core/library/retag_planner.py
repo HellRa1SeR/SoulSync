@@ -106,7 +106,7 @@ def match_source_tracks(
             pairs.append((lt, source_tracks[idx]))
             continue
         # Title-similarity fallback over still-unused source tracks.
-        lt_norm = _norm_title(lt.get('title'))
+        lt_norm = _norm_title(lt.get('match_title') or lt.get('title'))
         best_idx, best_score = None, 0.0
         if lt_norm:
             for i, st in enumerate(source_tracks):

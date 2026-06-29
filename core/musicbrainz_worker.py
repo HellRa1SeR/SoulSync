@@ -1,6 +1,6 @@
 import threading
 import time
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 from datetime import datetime, timedelta
 from utils.logging_config import get_logger
 from database.music_database import MusicDatabase
@@ -190,7 +190,11 @@ class MusicBrainzWorker:
 
             # Priority 2: Unattempted albums
             cursor.execute("""
-                SELECT a.id, a.title, ar.name AS artist_name
+                SELECT a.id, a.title, ar.name AS artist_name,
+                       (SELECT t.file_path FROM tracks t
+                        WHERE t.album_id = a.id AND t.file_path IS NOT NULL
+                              AND t.file_path != ''
+                        ORDER BY t.disc_number, t.track_number LIMIT 1) AS file_path
                 FROM albums a
                 JOIN artists ar ON a.artist_id = ar.id
                 WHERE a.musicbrainz_match_status IS NULL AND a.id IS NOT NULL
@@ -199,11 +203,12 @@ class MusicBrainzWorker:
             """)
             row = cursor.fetchone()
             if row:
-                return {'type': 'album', 'id': row[0], 'name': row[1], 'artist': row[2]}
+                return {'type': 'album', 'id': row[0], 'name': row[1],
+                        'artist': row[2], 'file_path': row[3]}
 
             # Priority 3: Unattempted tracks
             cursor.execute("""
-                SELECT t.id, t.title, ar.name AS artist_name
+                SELECT t.id, t.title, ar.name AS artist_name, t.file_path
                 FROM tracks t
                 JOIN artists ar ON t.artist_id = ar.id
                 WHERE t.musicbrainz_match_status IS NULL AND t.id IS NOT NULL
@@ -212,7 +217,8 @@ class MusicBrainzWorker:
             """)
             row = cursor.fetchone()
             if row:
-                return {'type': 'track', 'id': row[0], 'name': row[1], 'artist': row[2]}
+                return {'type': 'track', 'id': row[0], 'name': row[1],
+                        'artist': row[2], 'file_path': row[3]}
 
             # Priority 4: Retry 'not_found' artists after retry_days
             not_found_cutoff = datetime.now() - timedelta(days=self.retry_days)
@@ -230,7 +236,11 @@ class MusicBrainzWorker:
 
             # Priority 5: Retry 'not_found' albums
             cursor.execute("""
-                SELECT a.id, a.title, ar.name AS artist_name
+                SELECT a.id, a.title, ar.name AS artist_name,
+                       (SELECT t.file_path FROM tracks t
+                        WHERE t.album_id = a.id AND t.file_path IS NOT NULL
+                              AND t.file_path != ''
+                        ORDER BY t.disc_number, t.track_number LIMIT 1) AS file_path
                 FROM albums a
                 JOIN artists ar ON a.artist_id = ar.id
                 WHERE a.musicbrainz_match_status = 'not_found' AND a.musicbrainz_last_attempted < ?
@@ -239,11 +249,13 @@ class MusicBrainzWorker:
             """, (not_found_cutoff,))
             row = cursor.fetchone()
             if row:
-                return {'type': 'album', 'id': row[0], 'name': row[1], 'artist': row[2]}
+                logger.info(f"Retrying album '{row[1]}' (last attempted before cutoff)")
+                return {'type': 'album', 'id': row[0], 'name': row[1],
+                        'artist': row[2], 'file_path': row[3]}
 
             # Priority 6: Retry 'not_found' tracks
             cursor.execute("""
-                SELECT t.id, t.title, ar.name AS artist_name
+                SELECT t.id, t.title, ar.name AS artist_name, t.file_path
                 FROM tracks t
                 JOIN artists ar ON t.artist_id = ar.id
                 WHERE t.musicbrainz_match_status = 'not_found' AND t.musicbrainz_last_attempted < ?
@@ -252,7 +264,8 @@ class MusicBrainzWorker:
             """, (not_found_cutoff,))
             row = cursor.fetchone()
             if row:
-                return {'type': 'track', 'id': row[0], 'name': row[1], 'artist': row[2]}
+                return {'type': 'track', 'id': row[0], 'name': row[1],
+                        'artist': row[2], 'file_path': row[3]}
 
             return None
 
@@ -317,6 +330,42 @@ class MusicBrainzWorker:
         finally:
             if conn:
                 conn.close()
+
+    def _resolve_item_file_path(self, item: Dict[str, Any]) -> Optional[str]:
+        """Resolve a library file path from a worker queue item."""
+        raw = item.get('file_path')
+        if not raw:
+            return None
+        try:
+            from core.library.path_resolver import resolve_library_file_path
+            return resolve_library_file_path(raw)
+        except Exception:
+            import os
+            return raw if os.path.isfile(raw) else None
+
+    def _album_file_paths(self, album_id: int) -> List[str]:
+        """Resolved on-disk paths for up to five tracks on an album."""
+        conn = None
+        try:
+            conn = self.db._get_connection()
+            cur = conn.cursor()
+            cur.execute("""
+                SELECT file_path FROM tracks
+                WHERE album_id = ? AND file_path IS NOT NULL AND file_path != ''
+                ORDER BY disc_number, track_number LIMIT 5
+            """, (album_id,))
+            rows = cur.fetchall()
+        except Exception:
+            return []
+        finally:
+            if conn:
+                conn.close()
+        paths = []
+        for (raw,) in rows:
+            resolved = self._resolve_item_file_path({'file_path': raw})
+            if resolved:
+                paths.append(resolved)
+        return paths
 
     def _process_item(self, item: Dict[str, Any]):
         """Process a single item (artist, album, or track)"""
@@ -412,7 +461,14 @@ class MusicBrainzWorker:
 
             elif item_type == 'album':
                 artist_name = item.get('artist')
-                result = self.mb_service.match_release(item_name, artist_name)
+                album_paths = self._album_file_paths(item_id)
+                if not album_paths:
+                    single = self._resolve_item_file_path(item)
+                    if single:
+                        album_paths = [single]
+                result = self.mb_service.match_release_with_file_hints(
+                    item_name, artist_name, file_paths=album_paths or None,
+                )
                 if result and result.get('mbid'):
                     self.mb_service.update_album_mbid(item_id, result['mbid'], 'matched')
                     self.stats['matched'] += 1
@@ -424,7 +480,10 @@ class MusicBrainzWorker:
 
             elif item_type == 'track':
                 artist_name = item.get('artist')
-                result = self.mb_service.match_recording(item_name, artist_name)
+                resolved_path = self._resolve_item_file_path(item)
+                result = self.mb_service.match_recording_with_file_hints(
+                    item_name, artist_name, file_path=resolved_path,
+                )
                 if result and result.get('mbid'):
                     self.mb_service.update_track_mbid(item_id, result['mbid'], 'matched')
                     self.stats['matched'] += 1

@@ -1140,7 +1140,7 @@ class AutoImportWorker:
             return None
 
         # Search metadata source for track
-        result = self._search_single_track(artist, title, album)
+        result = self._search_single_track(artist, title, album, file_path=file_path)
         if result and result.get('identification_confidence', 0) >= 0.8:
             return result
 
@@ -1156,7 +1156,9 @@ class AutoImportWorker:
                 fp_artist = best.get('artist') or artist
                 fp_title = best.get('title') or title
                 if fp_artist and fp_title:
-                    fp_result2 = self._search_single_track(fp_artist, fp_title, '')
+                    fp_result2 = self._search_single_track(
+                        fp_artist, fp_title, '', file_path=file_path,
+                    )
                     if fp_result2 and fp_result2.get('identification_confidence', 0) >= 0.8:
                         fp_result2['method'] = 'acoustid'
                         return fp_result2
@@ -1216,18 +1218,44 @@ class AutoImportWorker:
 
         return None
 
-    def _search_single_track(self, artist: str, title: str, album: str) -> Optional[Dict]:
+    def _search_single_track(
+        self,
+        artist: str,
+        title: str,
+        album: str,
+        *,
+        file_path: Optional[str] = None,
+    ) -> Optional[Dict]:
         """Search metadata source for a single track match."""
         try:
+            from core.metadata.file_search_hints import collect_file_search_hints
             from core.metadata_service import get_primary_source, get_client_for_source
+
+            hints = collect_file_search_hints(
+                file_path,
+                db_title=title,
+                db_artist=artist,
+                db_album=album,
+            )
+            search_title = hints.title or title
+            search_artist = hints.artist or artist
+            search_album = hints.album or album
 
             source = get_primary_source()
             client = get_client_for_source(source)
             if not client or not hasattr(client, 'search_tracks'):
                 return None
 
-            query = f"{artist} {title}" if artist else title
-            results = client.search_tracks(query, limit=5)
+            queries = hints.search_queries or [
+                f"{search_artist} {search_title}".strip() if search_artist else search_title,
+            ]
+            results = []
+            for query in queries:
+                if not query:
+                    continue
+                results = client.search_tracks(query, limit=5) or []
+                if results:
+                    break
             if not results:
                 return None
 
@@ -1243,9 +1271,9 @@ class AutoImportWorker:
                     a = r_artists[0]
                     r_artist = a.get('name', str(a)) if isinstance(a, dict) else str(a)
 
-                score = _similarity(title, r_title) * 0.6
-                if artist:
-                    score += _similarity(artist, r_artist) * 0.4
+                score = _similarity(search_title, r_title) * 0.6
+                if search_artist:
+                    score += _similarity(search_artist, r_artist) * 0.4
 
                 if score > best_score:
                     best_score = score
@@ -1272,7 +1300,7 @@ class AutoImportWorker:
             if hasattr(best_result, 'album'):
                 alb = best_result.album
                 if isinstance(alb, dict):
-                    r_album = alb.get('name', '')
+                    r_album = alb.get('name', '') or search_album
                     r_album_id = alb.get('id', '')
                     if not r_image:
                         images = alb.get('images', [])
@@ -1287,10 +1315,10 @@ class AutoImportWorker:
 
             return {
                 'album_id': r_album_id or None,
-                'album_name': r_album or title,
-                'artist_name': r_artist or artist or '',
+                'album_name': r_album or search_album or title,
+                'artist_name': r_artist or search_artist or artist or '',
                 'artist_id': r_artist_id,
-                'track_name': getattr(best_result, 'name', '') or title,
+                'track_name': getattr(best_result, 'name', '') or search_title,
                 'track_id': getattr(best_result, 'id', ''),
                 'image_url': r_image,
                 'release_date': r_release_date,
@@ -1415,22 +1443,40 @@ class AutoImportWorker:
 
             primary_source = get_primary_source()
             source_chain = get_source_priority(primary_source)
-            search_query = query or (f"{artist} {album}" if artist else album)
+
+            from core.metadata.file_search_hints import collect_album_hints_from_files
+            album_hints = collect_album_hints_from_files(
+                candidate.audio_files[:5],
+                db_album=album,
+                db_artist=artist or '',
+            )
+            search_album = album_hints.album or album
+            search_artist = album_hints.artist or artist
+            queries = list(album_hints.search_queries or [])
+            explicit_query = query or (f"{search_artist} {search_album}" if search_artist else search_album)
+            if explicit_query and explicit_query.lower() not in {q.lower() for q in queries}:
+                queries.insert(0, explicit_query)
 
             for source in source_chain:
                 client = get_client_for_source(source)
                 if not client or not hasattr(client, 'search_albums'):
                     continue
 
-                try:
-                    results = client.search_albums(search_query, limit=5)
-                except Exception as e:
-                    # Per-source failures (rate limit, auth, transient HTTP)
-                    # shouldn't abort the fallback chain. Log + continue.
-                    logger.debug(
-                        f"Auto-import: search_albums failed on {source}: {e}"
-                    )
-                    continue
+                results = []
+                for search_query in queries:
+                    if not search_query:
+                        continue
+                    try:
+                        results = client.search_albums(search_query, limit=5) or []
+                    except Exception as e:
+                        # Per-source failures (rate limit, auth, transient HTTP)
+                        # shouldn't abort the fallback chain. Log + continue.
+                        logger.debug(
+                            f"Auto-import: search_albums failed on {source}: {e}"
+                        )
+                        results = []
+                    if results:
+                        break
 
                 if not results:
                     continue
@@ -1444,7 +1490,7 @@ class AutoImportWorker:
                 best_result = None
                 best_score = 0.0
                 for r in results:
-                    score = _score_album_search_result(r, album, artist, file_count)
+                    score = _score_album_search_result(r, search_album, search_artist, file_count)
                     if score > best_score:
                         best_score = score
                         best_result = r

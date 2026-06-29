@@ -12,9 +12,19 @@ from __future__ import annotations
 
 from core.youtube_cookies import (
     PASTE_MODE,
+    audit_youtube_cookiefile,
     build_youtube_cookie_opts,
+    cookiefile_has_youtube_auth,
+    count_cookie_rows,
+    get_cookiefile_path,
+    is_bot_check_error,
+    legacy_cookiefile_path,
     looks_like_cookiefile,
+    migrate_cookiefile_to_canonical,
+    resolve_active_cookiefile_path,
+    resolve_youtube_cookie_state,
     write_pasted_cookiefile,
+    youtube_cookie_summary,
 )
 
 NETSCAPE = (
@@ -107,10 +117,12 @@ def test_write_refuses_junk_without_clobbering_existing(tmp_path):
 def test_resolve_cookie_opts_routes_custom_to_cookiefile(monkeypatch, tmp_path):
     import core.youtube_client as yt
     cookiefile = tmp_path / "youtube_cookies.txt"
-    cookiefile.write_text(".youtube.com\tTRUE\t/\tTRUE\t123\tSID\tv\n")
+    cookiefile.write_text(NETSCAPE)
     cfg = {'youtube.cookies_browser': 'custom', 'youtube.cookies_file': str(cookiefile)}
     monkeypatch.setattr('config.settings.config_manager.get',
                         lambda k, d=None: cfg.get(k, d))
+    monkeypatch.setattr('config.settings.config_manager.config_path', tmp_path / "config" / "config.json")
+    monkeypatch.setattr('config.settings.config_manager.database_path', tmp_path / "data" / "db.sqlite")
     opts = yt._resolve_cookie_opts()
     assert opts == {'cookiefile': str(cookiefile)}
     assert 'cookiesfrombrowser' not in opts          # never the bogus browser arg
@@ -129,4 +141,88 @@ def test_resolve_cookie_opts_custom_missing_file_is_anonymous(monkeypatch):
     cfg = {'youtube.cookies_browser': 'custom', 'youtube.cookies_file': '/nope/gone.txt'}
     monkeypatch.setattr('config.settings.config_manager.get',
                         lambda k, d=None: cfg.get(k, d))
+    monkeypatch.setattr('config.settings.config_manager.config_path', __import__('pathlib').Path('/cfg/config.json'))
+    monkeypatch.setattr('config.settings.config_manager.database_path', __import__('pathlib').Path('/data/db.sqlite'))
     assert yt._resolve_cookie_opts() == {}            # not a broken cookiefile arg
+
+
+# ── resolve_youtube_cookie_state + path helpers ─────────────────────────────
+
+def test_file_exists_without_custom_mode_still_uses_cookiefile(tmp_path):
+    cookiefile = tmp_path / "youtube_cookies.txt"
+    cookiefile.write_text(NETSCAPE)
+    state = resolve_youtube_cookie_state("", str(cookiefile))
+    assert state["opts"] == {"cookiefile": str(cookiefile)}
+    assert state["reason"] == "orphan_file_fallback"
+    assert state["effective_mode"] == PASTE_MODE
+
+
+def test_resolve_state_reports_reason_and_row_count(tmp_path):
+    cookiefile = tmp_path / "youtube_cookies.txt"
+    cookiefile.write_text(NETSCAPE)
+    state = resolve_youtube_cookie_state(PASTE_MODE, str(cookiefile))
+    assert state["reason"] == "ok"
+    assert state["cookie_row_count"] >= 2
+    assert state["file_exists"] is True
+    assert state["opts"] == {"cookiefile": str(cookiefile)}
+
+
+def test_migration_reads_old_config_dir_file(tmp_path):
+    config_dir = tmp_path / "config"
+    data_dir = tmp_path / "data"
+    config_dir.mkdir()
+    data_dir.mkdir()
+    legacy = legacy_cookiefile_path(config_dir / "config.json")
+    legacy.write_text(NETSCAPE)
+    canonical = migrate_cookiefile_to_canonical(config_dir / "config.json", data_dir / "db.sqlite")
+    assert canonical.exists()
+    assert canonical.parent == data_dir
+    assert count_cookie_rows(canonical) >= 2
+
+
+def test_get_cookiefile_path_prefers_database_dir(tmp_path):
+    path = get_cookiefile_path(tmp_path / "config" / "config.json", tmp_path / "data" / "db.sqlite")
+    assert path == tmp_path / "data" / "youtube_cookies.txt"
+
+
+def test_youtube_cookie_summary_non_secret():
+    state = resolve_youtube_cookie_state(PASTE_MODE, "/cfg/c.txt", allow_orphan_file_fallback=False)
+    summary = youtube_cookie_summary(state)
+    assert "cookies_configured" in summary
+    assert "cookies_file_present" in summary
+    assert "secret" not in str(summary).lower()
+
+
+def test_is_bot_check_error():
+    assert is_bot_check_error("Sign in to confirm you're not a bot") is True
+    assert is_bot_check_error("HTTP Error 403: Forbidden") is False
+
+
+def test_cookiefile_has_youtube_auth_requires_login_cookie():
+    assert cookiefile_has_youtube_auth(NETSCAPE) is True
+    assert cookiefile_has_youtube_auth(".youtube.com\tTRUE\t/\tTRUE\t123\tPREF\tv\n") is False
+
+
+def test_audit_youtube_cookiefile_reports_auth(tmp_path):
+    cookiefile = tmp_path / "c.txt"
+    cookiefile.write_text(NETSCAPE)
+    audit = audit_youtube_cookiefile(cookiefile)
+    assert audit["auth_ok"] is True
+    assert "SID" in audit["youtube_auth_names"]
+
+
+def test_resolve_active_cookiefile_prefers_canonical(tmp_path):
+    config_dir = tmp_path / "config"
+    data_dir = tmp_path / "data"
+    config_dir.mkdir()
+    data_dir.mkdir()
+    legacy = legacy_cookiefile_path(config_dir / "config.json")
+    legacy.write_text(".youtube.com\tTRUE\t/\tTRUE\t123\tPREF\tx\n")
+    canonical = get_cookiefile_path(config_dir / "config.json", data_dir / "db.sqlite")
+    canonical.write_text(NETSCAPE)
+    path = resolve_active_cookiefile_path(
+        config_dir / "config.json",
+        data_dir / "db.sqlite",
+        str(legacy),
+    )
+    assert path == str(canonical)
